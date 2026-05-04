@@ -28,9 +28,12 @@ _TIMEFRAME_DATE_FMT = {
     '5m':  '%H:%M',
 }
 
-_YF_INTERVAL_MAP = {
-    '1d': ('1d', '6mo'),
-    '1h': ('1h', '60d'),
+_YF_PARAMS = {
+    '1d':  ('1d',  '1y'),
+    '1h':  ('1h',  '30d'),
+    '4h':  ('1h',  '60d'),
+    '15m': ('15m', '7d'),
+    '5m':  ('5m',  '5d'),
 }
 
 
@@ -368,29 +371,68 @@ def _fetch_krx_data(query: str):
     return df, ticker, name
 
 
-def _fetch_yf_data(ticker: str, timeframe: str) -> pd.DataFrame:
-    """yfinance로 미국 주식 데이터 조회."""
+def _fetch_yf_ohlcv(yf_symbol: str, timeframe: str) -> pd.DataFrame:
+    """
+    yfinance OHLCV 조회. MultiIndex 컬럼 / 소문자 변환 / tz 처리 통합.
+    성공 시 open/high/low/close 컬럼의 DataFrame 반환.
+    """
     try:
         import yfinance as yf
     except ImportError:
-        raise ImportError("yfinance 패키지가 설치되지 않았습니다: pip install yfinance")
+        raise ImportError("yfinance 패키지가 설치되지 않았습니다.")
 
-    interval, period = _YF_INTERVAL_MAP.get(timeframe, ('1d', '6mo'))
-    data = yf.download(ticker, period=period, interval=interval,
-                       progress=False, auto_adjust=True)
+    interval, period = _YF_PARAMS.get(timeframe, ('1d', '1y'))
+    print(f"[YF TRY] {yf_symbol} interval={interval} period={period}")
+
+    data = yf.download(
+        yf_symbol,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+    )
 
     if data is None or data.empty:
-        raise ValueError(f"데이터를 가져올 수 없습니다: {ticker}")
+        print(f"[YF FAIL] {yf_symbol} empty dataframe")
+        raise ValueError(f"yfinance 데이터 없음: {yf_symbol}")
 
+    # MultiIndex 처리 (yfinance 버전에 따라 발생)
     if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+        data.columns = [col[0] for col in data.columns]
 
+    # 컬럼명 소문자 통일
     data.columns = [c.lower() for c in data.columns]
 
+    # tz 처리
     if data.index.tz is None:
         data.index = data.index.tz_localize('UTC')
 
-    return data[['open', 'high', 'low', 'close', 'volume']]
+    required = ['open', 'high', 'low', 'close']
+    missing = [c for c in required if c not in data.columns]
+    if missing:
+        print(f"[YF FAIL] {yf_symbol} missing columns: {missing}")
+        raise ValueError(f"yfinance 컬럼 누락: {missing}")
+
+    data = data[required].dropna()
+
+    if data.empty:
+        print(f"[YF FAIL] {yf_symbol} empty after dropna")
+        raise ValueError(f"yfinance 유효 데이터 없음: {yf_symbol}")
+
+    print(f"[YF OK] {yf_symbol} rows={len(data)}")
+    return data
+
+
+def _fetch_crypto_yf(symbol: str, timeframe: str):
+    """
+    코인 ccxt 실패 시 yfinance fallback.
+    'BTC/USDT' → 'BTC-USD' 로 조회.
+    Returns (df, 'yfinance') or raises Exception.
+    """
+    base = _base_from_symbol(symbol)
+    yf_symbol = f"{base}-USD"
+    df = _fetch_yf_ohlcv(yf_symbol, timeframe)
+    return df, 'yfinance'
 
 
 # ═══════════════════════════════════════════════════
@@ -548,37 +590,59 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
 # ═══════════════════════════════════════════════════
 
 def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """Bybit spot → Bybit perps → Binance spot → Binance futures 순서로 조회."""
+    """
+    /ac 조회 순서: Bybit spot → Bybit perps → Binance spot → Binance futures → yfinance fallback
+    """
     result = {
         'success': False, 'file_path': None, 'current_price': None,
         'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
+        # ── 1. ccxt 시도 ──────────────────────────────
         raw, exchange_name = _fetch_spot(symbol, timeframe, 100)
-        if not raw:
-            tried = ', '.join(label for *_, label in _AC_ATTEMPTS)
-            result['error'] = (
-                f"해당 코인 데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
-                f"시도한 거래소: {tried}"
-            )
-            return result
+        df = None
+
+        if raw:
+            df = _to_dataframe(raw)
+        else:
+            # ── 2. yfinance fallback ──────────────────
+            print(f"[AC FALLBACK] ccxt 전부 실패 → yfinance 시도: {symbol}")
+            try:
+                df, exchange_name = _fetch_crypto_yf(symbol, timeframe)
+            except Exception as yf_err:
+                print(f"[AC FALLBACK FAIL] yfinance: {yf_err}")
+                tried = ', '.join(label for *_, label in _AC_ATTEMPTS)
+                result['error'] = (
+                    f"데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
+                    f"시도: {tried}, yfinance"
+                )
+                return result
 
         result['exchange'] = exchange_name
-        df = _to_dataframe(raw)
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저 (1d 365봉 별도 조회)
-        raw_52w, _ = _fetch_spot(symbol, '1d', 365)
-        if not raw_52w:
-            raw_52w, _ = _fetch_perps(symbol, '1d', 365)
+        # ── 3. 52주 고/저 ─────────────────────────────
         high_52w = low_52w = None
-        if raw_52w:
-            df_52w   = _to_dataframe(raw_52w)
-            high_52w = float(df_52w['high'].max())
-            low_52w  = float(df_52w['low'].min())
+        if exchange_name == 'yfinance':
+            # 이미 1y 데이터 → 그대로 사용
+            high_52w = float(df['high'].max())
+            low_52w  = float(df['low'].min())
+        else:
+            raw_52w, _ = _fetch_spot(symbol, '1d', 365)
+            if raw_52w:
+                df_52w   = _to_dataframe(raw_52w)
+                high_52w = float(df_52w['high'].max())
+                low_52w  = float(df_52w['low'].min())
+            else:
+                try:
+                    df_52w, _ = _fetch_crypto_yf(symbol, '1d')
+                    high_52w  = float(df_52w['high'].max())
+                    low_52w   = float(df_52w['low'].min())
+                except Exception:
+                    pass
 
         base  = symbol.split('/')[0] + 'USDT'
         title = f"{base} - {timeframe.upper()} - {exchange_name}"
@@ -595,9 +659,9 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
         if low_52w is not None:
             lines.append(f"52주 최저가: {format_price(low_52w)} USDT")
 
-        result['success']  = True
+        result['success']   = True
         result['file_path'] = tmp_path
-        result['caption']  = '\n'.join(lines)
+        result['caption']   = '\n'.join(lines)
 
     except Exception as e:
         logger.error("create_clean_candlestick_chart 오류: %s", e)
@@ -746,7 +810,7 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
 
 
 def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
-    """미국 주식 차트 (yfinance, 1d / 1h 지원)."""
+    """미국 주식 차트 (yfinance). 1d / 1h 지원."""
     ticker = ticker.upper().strip()
     result = {
         'success': False, 'file_path': None, 'current_price': None,
@@ -759,19 +823,26 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         return result
 
     try:
-        df = _fetch_yf_data(ticker, timeframe)
+        print(f"[AU] {ticker} {timeframe}")
+        df = _fetch_yf_ohlcv(ticker, timeframe)
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저 (1d 데이터로 별도 계산)
+        # 52주 고/저
         high_52w = low_52w = None
-        try:
-            df_1d    = _fetch_yf_data(ticker, '1d')
-            high_52w = float(df_1d['high'].max())
-            low_52w  = float(df_1d['low'].min())
-        except Exception:
-            pass
+        if timeframe == '1d':
+            # 1d 1y 데이터를 이미 가져왔으므로 그대로 사용
+            high_52w = float(df['high'].max())
+            low_52w  = float(df['low'].min())
+        else:
+            # 1h 조회 시 1d 데이터를 별도로 가져와 52주 계산
+            try:
+                df_1d    = _fetch_yf_ohlcv(ticker, '1d')
+                high_52w = float(df_1d['high'].max())
+                low_52w  = float(df_1d['low'].min())
+            except Exception:
+                pass
 
         title    = f"{ticker} - {timeframe.upper()} - US"
         tmp_path = _make_tmp_path()
