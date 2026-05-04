@@ -1,0 +1,38 @@
+# 환경변수 / 시크릿
+.env
+.env.*
+config.py
+secrets.py
+
+# 데이터베이스
+*.db
+*.sqlite
+*.sqlite3
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# 차트 임시 파일
+*.png
+chart_*.png
+
+# 로그
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

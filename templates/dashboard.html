@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>채팅 통계 대시보드</title>
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { background: #f0f2f5; }
+
+    .page-header {
+      background: #1a1d23; color: #fff;
+      padding: 1.25rem 1.5rem; border-radius: 14px; margin-bottom: 1.5rem;
+    }
+    .page-header h1 { font-size: 1.6rem; font-weight: 700; margin: 0; }
+
+    .refresh-bar {
+      background: #fff;
+      border: 1px solid #e9ecef;
+      border-radius: 10px;
+      padding: .6rem 1rem;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: .75rem;
+      font-size: .875rem;
+    }
+    .refresh-bar .form-check { margin: 0; }
+    #refreshCountdown {
+      font-variant-numeric: tabular-nums;
+      min-width: 80px;
+    }
+
+    .card { border: none; border-radius: 14px; box-shadow: 0 2px 10px rgba(0,0,0,.07); }
+    .card-title { font-weight: 600; font-size: 1rem; color: #343a40; }
+
+    .stat-card .label {
+      font-size: .75rem; text-transform: uppercase;
+      letter-spacing: .06em; color: #6c757d;
+    }
+    .stat-card .value     { font-size: 2rem; font-weight: 700; line-height: 1.2; }
+    .stat-card .top-value { font-size: 1rem; font-weight: 600; word-break: break-word; }
+
+    .chart-wrap { position: relative; height: 300px; }
+
+    /* 그래프 no-data 오버레이 */
+    .chart-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 300px;
+      color: #adb5bd;
+      font-size: 1rem;
+      border: 2px dashed #dee2e6;
+      border-radius: 10px;
+    }
+
+    .table thead th { background: #343a40; color: #fff; border: none; font-size: .85rem; }
+    .table tbody tr:hover { background: #f8f9fa; }
+    .table td, .table th { vertical-align: middle; }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+
+  <!-- 헤더 -->
+  <div class="page-header d-flex align-items-center gap-2">
+    <span style="font-size:1.8rem;">📊</span>
+    <h1>채팅 통계 대시보드</h1>
+  </div>
+
+  <!-- 날짜 선택 폼 -->
+  <div class="card mb-3">
+    <div class="card-body">
+      <form method="get" action="/" class="row g-3 align-items-end">
+        <div class="col-sm-5">
+          <label class="form-label fw-semibold">시작일</label>
+          <input type="date" name="start_date" class="form-control"
+                 value="{{ start_date }}" required>
+        </div>
+        <div class="col-sm-5">
+          <label class="form-label fw-semibold">종료일</label>
+          <input type="date" name="end_date" class="form-control"
+                 value="{{ end_date }}" required>
+        </div>
+        <div class="col-sm-2">
+          <button type="submit" class="btn btn-primary w-100">조회</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 자동 갱신 상태 바 -->
+  <div class="refresh-bar mb-4">
+    <div class="form-check form-switch">
+      <input class="form-check-input" type="checkbox" id="autoRefreshToggle" role="switch">
+      <label class="form-check-label fw-semibold" for="autoRefreshToggle">자동 갱신</label>
+    </div>
+    <span id="refreshStatus" class="badge">-</span>
+    <span id="refreshCountdown" class="text-muted"></span>
+    <span class="text-muted ms-auto">
+      마지막 갱신: <strong id="lastRefreshTime">-</strong>
+    </span>
+  </div>
+
+  <!-- 오류 메시지 -->
+  {% if error %}
+  <div class="alert alert-danger rounded-3" role="alert">
+    <strong>⚠️ 오류:</strong> {{ error }}
+  </div>
+  {% endif %}
+
+  {% if stats %}
+
+    <!-- ────────────────────────────────────────────────
+         날짜별 채팅량 꺾은선 그래프
+         조회 기간에 관계없이 항상 표시.
+         데이터가 없으면 JS 에서 빈 안내 문구로 대체.
+    ──────────────────────────────────────────────── -->
+    <div class="card mb-4">
+      <div class="card-body">
+        <h6 class="card-title mb-3">📈 날짜별 채팅량</h6>
+        <!-- 데이터 있을 때 canvas, 없을 때 empty 안내 (JS가 전환) -->
+        <div id="lineChartWrap" class="chart-wrap">
+          <canvas id="dailyLineChart"></canvas>
+        </div>
+        <div id="lineChartEmpty" class="chart-empty" style="display:none;">
+          해당 기간 데이터가 없습니다.
+        </div>
+      </div>
+    </div>
+
+    {% if not stats.has_data %}
+    <div class="alert alert-info rounded-3" role="alert">
+      📭 해당 기간에 기록된 데이터가 없습니다.
+    </div>
+    {% else %}
+
+    <!-- 요약 카드 4개 -->
+    <div class="row g-3 mb-4">
+      <div class="col-6 col-md-3">
+        <div class="card stat-card h-100">
+          <div class="card-body">
+            <div class="label">총 메시지</div>
+            <div class="value">{{ stats.total }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card stat-card h-100">
+          <div class="card-body">
+            <div class="label">참여 유저</div>
+            <div class="value">{{ stats.unique_users }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card stat-card h-100">
+          <div class="card-body">
+            <div class="label">하루 평균</div>
+            <div class="value">{{ stats.avg_per_day }}</div>
+          </div>
+        </div>
+      </div>
+      <div class="col-6 col-md-3">
+        <div class="card stat-card h-100">
+          <div class="card-body">
+            <div class="label">최다 발언 유저</div>
+            <div class="top-value mt-1">{{ stats.top_user }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 유저별 누적 가로 막대그래프 -->
+    <div class="card mb-4">
+      <div class="card-body">
+        <h6 class="card-title mb-3">👤 유저별 누적 메시지 수 (TOP 20)</h6>
+        <div class="chart-wrap">
+          <canvas id="userChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- 표 1: 유저별 -->
+    <div class="card mb-4">
+      <div class="card-body">
+        <h6 class="card-title mb-3">📋 유저별 메시지 수</h6>
+        <div class="table-responsive">
+          <table class="table table-hover mb-0">
+            <thead>
+              <tr>
+                <th style="width:60px">순위</th>
+                <th>유저</th>
+                <th class="text-end">메시지 수</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for name, cnt in stats.user_table %}
+              <tr>
+                <td>{{ loop.index }}</td>
+                <td>{{ name }}</td>
+                <td class="text-end">{{ cnt }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 표 2: 날짜별 -->
+    <div class="card mb-4">
+      <div class="card-body">
+        <h6 class="card-title mb-3">📆 날짜별 메시지 수</h6>
+        <div class="table-responsive">
+          <table class="table table-hover mb-0">
+            <thead>
+              <tr>
+                <th>날짜</th>
+                <th class="text-end">총 메시지</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for dt, cnt in stats.date_table %}
+              <tr>
+                <td>{{ dt }}</td>
+                <td class="text-end">{{ cnt }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 표 3: 날짜 + 유저 상세 -->
+    <div class="card mb-4">
+      <div class="card-body">
+        <h6 class="card-title mb-3">🔍 날짜 + 유저별 상세</h6>
+        <div class="table-responsive">
+          <table class="table table-hover table-sm mb-0">
+            <thead>
+              <tr>
+                <th>날짜</th>
+                <th>유저</th>
+                <th class="text-end">메시지 수</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for dt, name, cnt in stats.detail_table %}
+              <tr>
+                <td>{{ dt }}</td>
+                <td>{{ name }}</td>
+                <td class="text-end">{{ cnt }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    {% endif %}<!-- /has_data -->
+
+    <!-- ── Chart.js 초기화 ── -->
+    <script>
+      /* ── 날짜별 꺾은선 그래프 ── */
+      const dailyLabels = {{ daily_labels | safe }};
+      const dailyCounts = {{ daily_counts | safe }};
+
+      if (dailyLabels.length === 0) {
+        document.getElementById('lineChartWrap').style.display = 'none';
+        document.getElementById('lineChartEmpty').style.display = 'flex';
+      } else {
+        new Chart(document.getElementById('dailyLineChart'), {
+          type: 'line',
+          data: {
+            labels: dailyLabels,
+            datasets: [{
+              label: '날짜별 채팅량',
+              data: dailyCounts,
+              tension: 0.3,
+              fill: false,
+              borderColor: 'rgba(99, 132, 255, 1)',
+              backgroundColor: 'rgba(99, 132, 255, 0.15)',
+              pointBackgroundColor: 'rgba(99, 132, 255, 1)',
+              pointRadius: 4,
+              pointHoverRadius: 6,
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: { display: true }
+            },
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: { precision: 0 }
+              }
+            }
+          }
+        });
+      }
+
+      /* ── 유저별 가로 막대그래프 (데이터 있을 때만) ── */
+      const userChartEl = document.getElementById('userChart');
+      if (userChartEl) {
+        const userLabels = {{ user_labels | safe }};
+        const userCounts = {{ user_counts | safe }};
+
+        new Chart(userChartEl, {
+          type: 'bar',
+          data: {
+            labels: userLabels,
+            datasets: [{
+              label: '메시지 수',
+              data: userCounts,
+              backgroundColor: 'rgba(255, 159, 64, 0.75)',
+              borderRadius: 6,
+            }]
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { x: { beginAtZero: true, ticks: { precision: 0 } } }
+          }
+        });
+      }
+    </script>
+
+  {% endif %}<!-- /stats -->
+
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+
+<!-- ── 자동 갱신 스크립트 ── -->
+<script>
+(function () {
+  const INTERVAL_SEC = 5;
+  const LS_KEY       = 'autoRefresh';
+
+  const checkbox     = document.getElementById('autoRefreshToggle');
+  const statusEl     = document.getElementById('refreshStatus');
+  const countdownEl  = document.getElementById('refreshCountdown');
+  const lastTimeEl   = document.getElementById('lastRefreshTime');
+
+  let reloadTimer    = null;
+  let tickTimer      = null;
+  let remaining      = INTERVAL_SEC;
+
+  function nowString() {
+    const d = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function setOn() {
+    statusEl.textContent = '5초마다 자동 갱신 중';
+    statusEl.className   = 'badge bg-success';
+  }
+
+  function setOff() {
+    statusEl.textContent    = '자동 갱신 중지됨';
+    statusEl.className      = 'badge bg-secondary';
+    countdownEl.textContent = '';
+  }
+
+  function clearTimers() {
+    clearTimeout(reloadTimer);
+    clearInterval(tickTimer);
+    reloadTimer = tickTimer = null;
+  }
+
+  function startRefresh() {
+    clearTimers();
+    remaining = INTERVAL_SEC;
+    setOn();
+    countdownEl.textContent = `${remaining}초 후 갱신`;
+
+    tickTimer = setInterval(() => {
+      remaining -= 1;
+      countdownEl.textContent = remaining > 0 ? `${remaining}초 후 갱신` : '갱신 중...';
+    }, 1000);
+
+    reloadTimer = setTimeout(() => {
+      window.location.reload();
+    }, INTERVAL_SEC * 1000);
+  }
+
+  function stopRefresh() {
+    clearTimers();
+    setOff();
+  }
+
+  lastTimeEl.textContent = nowString();
+
+  const saved = localStorage.getItem(LS_KEY);
+  const isOn  = saved === null ? true : saved === 'true';
+  checkbox.checked = isOn;
+  if (isOn) { startRefresh(); } else { setOff(); }
+
+  checkbox.addEventListener('change', () => {
+    localStorage.setItem(LS_KEY, checkbox.checked);
+    if (checkbox.checked) { startRefresh(); } else { stopRefresh(); }
+  });
+})();
+</script>
+
+</body>
+</html>
