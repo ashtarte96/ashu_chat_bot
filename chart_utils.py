@@ -100,6 +100,19 @@ def _base_from_symbol(symbol: str) -> str:
     return symbol.split('/')[0].upper()
 
 
+def _to_bybit_perps_symbol(user_input: str) -> str:
+    """
+    사용자 입력을 Bybit perps symbol로 변환.
+    BTC / btc / BTC/USDT / BTCUSDT → 모두 'BTCUSDT'
+    """
+    s = user_input.upper().strip()
+    if '/' in s:              # BTC/USDT → BTC
+        s = s.split('/')[0]
+    if s.endswith('USDT'):    # BTCUSDT → 그대로
+        return s
+    return s + 'USDT'         # BTC → BTCUSDT
+
+
 def _bybit_kline(category: str, symbol: str, timeframe: str, limit: int = 365):
     """
     Bybit v5 /market/kline 직접 호출.
@@ -183,7 +196,7 @@ def _fetch_spot(symbol: str, timeframe: str, limit: int = 365):
 
 def _fetch_perps(symbol: str, timeframe: str, limit: int = 365):
     """
-    /ap: Bybit perps only
+    /ap: Bybit perps only  (내부 호환용, create_perps_chart는 _fetch_perps_ap 사용)
     Returns (df, label) or (None, None).
     """
     base         = _base_from_symbol(symbol)
@@ -194,6 +207,67 @@ def _fetch_perps(symbol: str, timeframe: str, limit: int = 365):
         return df, 'Bybit perps'
 
     return None, None
+
+
+def _fetch_perps_ap(symbol: str, timeframe: str, limit: int = 365):
+    """
+    /ap 전용: Bybit v5 linear kline 직접 호출.
+    symbol = 'BTC/USDT', 'BTC', 'BTCUSDT', 'btc' 모두 허용.
+    Returns (df, None) on success, (None, err_msg) on failure.
+    """
+    bybit_symbol = _to_bybit_perps_symbol(symbol)
+    interval     = _BYBIT_INTERVAL.get(timeframe, 'D')
+    url          = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol":   bybit_symbol,
+        "interval": interval,
+        "limit":    limit,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        print(f"[AP BYBIT URL] {r.url}")
+        print(f"[AP BYBIT STATUS] {r.status_code}")
+        print(f"[AP BYBIT BODY] {r.text[:500]}")
+
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+
+        data = r.json()
+        if data.get('retCode') != 0:
+            print(f"[AP BYBIT ERROR] {data}")
+            return None, data.get('retMsg', 'unknown error')
+
+        rows = data.get('result', {}).get('list', [])
+        if not rows:
+            return None, "empty list"
+
+        # Bybit 는 최신순 → timestamp 오름차순 정렬
+        rows = sorted(rows, key=lambda x: int(x[0]))
+
+        df = pd.DataFrame(
+            rows,
+            columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'],
+        )
+        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
+        df.index.name = 'timestamp'
+
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        df = df[['open', 'high', 'low', 'close']].dropna()
+
+        if df.empty:
+            return None, "empty after conversion"
+
+        print(f"[AP BYBIT OK] {bybit_symbol} timeframe={timeframe} rows={len(df)}")
+        return df, None
+
+    except Exception as e:
+        print(f"[AP BYBIT FAIL] {e}")
+        logger.warning("[AP BYBIT FAIL] %s %s: %s", symbol, timeframe, e)
+        return None, str(e)
 
 
 # ═══════════════════════════════════════════════════
@@ -717,44 +791,46 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
     """
-    /ap: Bybit perps only
+    /ap: Bybit perps only (category=linear, _fetch_perps_ap 사용)
     """
+    bybit_symbol = _to_bybit_perps_symbol(symbol)
+    base_name    = bybit_symbol.replace('USDT', '')   # 'BTC'
+
     result = {
         'success': False, 'file_path': None, 'current_price': None,
-        'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
+        'symbol': symbol, 'timeframe': timeframe, 'exchange': 'Bybit perps',
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        df, exchange_name = _fetch_perps(symbol, timeframe, 365)
+        df, err_msg = _fetch_perps_ap(symbol, timeframe, 365)
         if df is None:
             result['error'] = (
-                f"해당 선물 데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
-                f"시도: Bybit perps"
+                f"해당 선물 데이터를 가져올 수 없습니다: {base_name}\n"
+                f"Bybit 응답: {err_msg}"
             )
             return result
 
-        result['exchange'] = exchange_name
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
+        # 52주 고/저
         high_52w = low_52w = None
         if timeframe == '1d':
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
-            df_1d, _ = _fetch_perps(symbol, '1d', 365)
+            df_1d, err_1d = _fetch_perps_ap(symbol, '1d', 365)
             if df_1d is not None:
                 high_52w = float(df_1d['high'].max())
                 low_52w  = float(df_1d['low'].min())
 
-        base  = symbol.split('/')[0] + 'USDT'
-        title = f"{base} - {timeframe.upper()} - {exchange_name}"
+        title    = f"{bybit_symbol} - {timeframe.upper()} - Bybit perps"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {symbol} 차트 ({timeframe})\n",
+            f"📊 {bybit_symbol} 차트 ({timeframe})\n",
             f"현재가: {format_price(current_price)} USDT",
             f"전일대비: {_change_line(current_price, prev_price)}",
         ]
