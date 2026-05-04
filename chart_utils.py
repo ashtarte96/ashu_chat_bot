@@ -80,47 +80,106 @@ def _change_line(current: float, prev: float, fmt_fn=None) -> str:
 # 데이터 조회
 # ═══════════════════════════════════════════════════
 
-def _fetch_spot(symbol: str, timeframe: str, limit: int):
-    """Binance spot → Bybit spot."""
-    for exchange_cls, name in [(ccxt.binance, 'BINANCE'), (ccxt.bybit, 'BYBIT')]:
+def _base_from_symbol(symbol: str) -> str:
+    """'BTC/USDT' → 'BTC'"""
+    return symbol.split('/')[0].upper()
+
+
+def _make_exchange(cls, extra_opts: dict) -> ccxt.Exchange:
+    return cls({
+        'enableRateLimit': True,
+        'timeout': 30000,
+        **extra_opts,
+    })
+
+
+def _try_fetch_on(
+    exchange: ccxt.Exchange,
+    candidates: list,
+    timeframe: str,
+    limit: int,
+    label: str,
+):
+    """
+    단일 거래소에서 심볼 후보를 순서대로 시도.
+    성공 시 (ohlcv, label) 반환, 실패 시 (None, None).
+    """
+    try:
+        markets = exchange.load_markets()
+    except Exception as e:
+        print(f"[FETCH FAIL] {label} load_markets: {e}")
+        logger.warning("[FETCH FAIL] %s load_markets: %s", label, e)
+        return None, None
+
+    for symbol in candidates:
+        if symbol not in markets:
+            continue
+        print(f"[FETCH TRY] {label} {symbol} {timeframe}")
         try:
-            ex = exchange_cls({'enableRateLimit': True})
-            markets = ex.load_markets()
-            if symbol in markets:
-                ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-                if ohlcv:
-                    return ohlcv, name
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if ohlcv:
+                print(f"[FETCH OK] {label} {symbol}")
+                logger.info("[FETCH OK] %s %s", label, symbol)
+                return ohlcv, label
         except Exception as e:
-            logger.warning("%s spot 조회 실패 (%s): %s", name, symbol, e)
+            print(f"[FETCH FAIL] {label} {symbol} {e}")
+            logger.warning("[FETCH FAIL] %s %s: %s", label, symbol, e)
+
+    return None, None
+
+
+_AC_ATTEMPTS = [
+    # (거래소 클래스, 옵션, 심볼 후보 템플릿, 레이블)
+    (ccxt.bybit,   {'options': {'defaultType': 'spot'}},   ['spot'],   'Bybit spot'),
+    (ccxt.bybit,   {'options': {'defaultType': 'linear'}}, ['linear'], 'Bybit perps'),
+    (ccxt.binance, {},                                      ['spot'],   'Binance spot'),
+    (ccxt.binance, {'options': {'defaultType': 'future'}}, ['linear'], 'Binance futures'),
+]
+
+_AP_ATTEMPTS = [
+    (ccxt.bybit,   {'options': {'defaultType': 'linear'}}, ['linear'], 'Bybit perps'),
+    (ccxt.binance, {'options': {'defaultType': 'future'}}, ['linear'], 'Binance futures'),
+]
+
+
+def _build_candidates(base: str, market_types: list) -> list:
+    """spot → ['BASE/USDT'], linear → ['BASE/USDT:USDT', 'BASE/USDT']"""
+    result = []
+    for t in market_types:
+        if t == 'spot':
+            result += [f"{base}/USDT"]
+        elif t == 'linear':
+            result += [f"{base}/USDT:USDT", f"{base}/USDT"]
+    return result
+
+
+def _fetch_spot(symbol: str, timeframe: str, limit: int):
+    """
+    /ac 조회 순서: Bybit spot → Bybit perps → Binance spot → Binance futures
+    Returns (ohlcv, label) or (None, None).
+    """
+    base = _base_from_symbol(symbol)
+    for cls, opts, mtype, label in _AC_ATTEMPTS:
+        candidates = _build_candidates(base, mtype)
+        ex = _make_exchange(cls, opts)
+        ohlcv, name = _try_fetch_on(ex, candidates, timeframe, limit, label)
+        if ohlcv:
+            return ohlcv, name
     return None, None
 
 
 def _fetch_perps(symbol: str, timeframe: str, limit: int):
-    """Bybit linear → Binance futures."""
-    base = symbol.split('/')[0]
-
-    try:
-        ex = ccxt.bybit({'enableRateLimit': True, 'options': {'defaultType': 'linear'}})
-        markets = ex.load_markets()
-        for candidate in (f"{base}/USDT:USDT", f"{base}/USDT"):
-            if candidate in markets:
-                ohlcv = ex.fetch_ohlcv(candidate, timeframe=timeframe, limit=limit)
-                if ohlcv:
-                    return ohlcv, 'BYBIT PERPS'
-    except Exception as e:
-        logger.warning("Bybit PERPS 조회 실패 (%s): %s", symbol, e)
-
-    try:
-        ex = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-        markets = ex.load_markets()
-        candidate = f"{base}/USDT"
-        if candidate in markets:
-            ohlcv = ex.fetch_ohlcv(candidate, timeframe=timeframe, limit=limit)
-            if ohlcv:
-                return ohlcv, 'BINANCE FUTURES'
-    except Exception as e:
-        logger.warning("Binance futures 조회 실패 (%s): %s", symbol, e)
-
+    """
+    /ap 조회 순서: Bybit perps → Binance futures
+    Returns (ohlcv, label) or (None, None).
+    """
+    base = _base_from_symbol(symbol)
+    for cls, opts, mtype, label in _AP_ATTEMPTS:
+        candidates = _build_candidates(base, mtype)
+        ex = _make_exchange(cls, opts)
+        ohlcv, name = _try_fetch_on(ex, candidates, timeframe, limit, label)
+        if ohlcv:
+            return ohlcv, name
     return None, None
 
 
@@ -489,7 +548,7 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
 # ═══════════════════════════════════════════════════
 
 def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """Spot(Binance → Bybit) → PERPS fallback 코인 차트."""
+    """Bybit spot → Bybit perps → Binance spot → Binance futures 순서로 조회."""
     result = {
         'success': False, 'file_path': None, 'current_price': None,
         'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
@@ -498,11 +557,10 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
     try:
         raw, exchange_name = _fetch_spot(symbol, timeframe, 100)
         if not raw:
-            raw, exchange_name = _fetch_perps(symbol, timeframe, 100)
-        if not raw:
+            tried = ', '.join(label for *_, label in _AC_ATTEMPTS)
             result['error'] = (
-                f"해당 코인 데이터를 가져올 수 없습니다. "
-                f"정확한 티커를 확인해주세요: {symbol.split('/')[0]}"
+                f"해당 코인 데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
+                f"시도한 거래소: {tried}"
             )
             return result
 
@@ -550,7 +608,7 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """PERPS 전용 코인 차트 (Bybit → Binance futures)."""
+    """Bybit perps → Binance futures 순서로 조회."""
     result = {
         'success': False, 'file_path': None, 'current_price': None,
         'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
@@ -559,9 +617,10 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
     try:
         raw, exchange_name = _fetch_perps(symbol, timeframe, 100)
         if not raw:
+            tried = ', '.join(label for *_, label in _AP_ATTEMPTS)
             result['error'] = (
-                f"선물 데이터를 가져올 수 없습니다. "
-                f"정확한 티커를 확인해주세요: {symbol.split('/')[0]}"
+                f"선물 데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
+                f"시도한 거래소: {tried}"
             )
             return result
 
