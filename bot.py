@@ -26,6 +26,7 @@ bot.py
 import asyncio
 import logging
 import os
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -1127,9 +1128,95 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ap BTC → 코인 선물 차트\n"
         "/ak 삼성전자 → 한국 주식\n"
         "/ak 005930 → 종목코드 조회\n"
-        "/au AAPL → 미국 주식"
+        "/au AAPL → 미국 주식\n"
+        "\n"
+        "🔧 디버그 (관리자)\n"
+        "/nettest → Render 네트워크 접근 테스트"
     )
     await update.message.reply_text(text)
+
+
+# ═══════════════════════════════════════════════════
+# /nettest — Render 네트워크 접근 디버그 (관리자 전용)
+# ═══════════════════════════════════════════════════
+
+async def cmd_nettest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    status_msg = await update.message.reply_text("🔍 네트워크 테스트 중...")
+
+    def _run_tests() -> str:
+        import requests as req
+
+        lines = ["🌐 네트워크 테스트\n"]
+
+        # 1. Bybit
+        try:
+            r = req.get("https://api.bybit.com/v5/market/time", timeout=10)
+            lines.append(f"✅ Bybit: {r.status_code}")
+            lines.append(r.text[:120])
+        except Exception:
+            print("[NETTEST ERROR]", traceback.format_exc())
+            lines.append(f"❌ Bybit: {traceback.format_exc().splitlines()[-1]}")
+
+        lines.append("")
+
+        # 2. Binance
+        try:
+            r = req.get("https://api.binance.com/api/v3/time", timeout=10)
+            lines.append(f"✅ Binance: {r.status_code}")
+            lines.append(r.text[:120])
+        except Exception:
+            print("[NETTEST ERROR]", traceback.format_exc())
+            lines.append(f"❌ Binance: {traceback.format_exc().splitlines()[-1]}")
+
+        lines.append("")
+
+        # 3. yfinance
+        try:
+            import yfinance as yf
+            t  = yf.Ticker("AAPL")
+            df = t.history(period="5d", interval="1d")
+            if df is not None and not df.empty:
+                close = float(df['Close'].iloc[-1])
+                lines.append(f"✅ yfinance:")
+                lines.append(f"AAPL close={close:.2f}")
+            else:
+                lines.append("❌ yfinance: 빈 데이터")
+        except Exception:
+            print("[NETTEST ERROR]", traceback.format_exc())
+            lines.append(f"❌ yfinance: {traceback.format_exc().splitlines()[-1]}")
+
+        lines.append("")
+
+        # 4. 서버 IP
+        try:
+            r = req.get("https://httpbin.org/ip", timeout=10)
+            lines.append(f"🌍 Server IP:")
+            lines.append(r.text.strip()[:120])
+        except Exception:
+            print("[NETTEST ERROR]", traceback.format_exc())
+            lines.append(f"❌ httpbin: {traceback.format_exc().splitlines()[-1]}")
+
+        return "\n".join(lines)
+
+    try:
+        report = await asyncio.to_thread(_run_tests)
+    except Exception:
+        print("[NETTEST ERROR]", traceback.format_exc())
+        report = "네트워크 테스트 실패\n" + traceback.format_exc()
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    await update.message.reply_text(report)
 
 
 # ═══════════════════════════════════════════════════
@@ -1150,6 +1237,7 @@ def main() -> None:
     app.add_handler(CommandHandler('mute',      cmd_mute))
     app.add_handler(CommandHandler('unmute',    cmd_unmute))
     app.add_handler(CommandHandler('help',      cmd_help))
+    app.add_handler(CommandHandler('nettest',   cmd_nettest))
     app.add_handler(CommandHandler('ac',        cmd_ac))
     app.add_handler(CommandHandler('ap',        cmd_ap))
     app.add_handler(CommandHandler('ak',        ak_chart))
