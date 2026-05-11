@@ -1131,13 +1131,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/au AAPL → 미국 주식\n"
         "\n"
         "🔧 디버그 (관리자)\n"
-        "/nettest → Render 네트워크 접근 테스트"
+        "/nettest → 서버 네트워크 접근 테스트"
     )
     await update.message.reply_text(text)
 
 
 # ═══════════════════════════════════════════════════
-# /nettest — Render 네트워크 접근 디버그 (관리자 전용)
+# /nettest — 네트워크 접근 디버그 (관리자 전용)
 # ═══════════════════════════════════════════════════
 
 async def cmd_nettest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1159,49 +1159,28 @@ async def cmd_nettest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             r = req.get("https://api.bybit.com/v5/market/time", timeout=10)
             lines.append(f"✅ Bybit: {r.status_code}")
-            lines.append(r.text[:120])
-        except Exception:
+        except Exception as e:
             print("[NETTEST ERROR]", traceback.format_exc())
-            lines.append(f"❌ Bybit: {traceback.format_exc().splitlines()[-1]}")
-
-        lines.append("")
+            lines.append(f"❌ Bybit: {e}")
 
         # 2. Binance
         try:
             r = req.get("https://api.binance.com/api/v3/time", timeout=10)
             lines.append(f"✅ Binance: {r.status_code}")
-            lines.append(r.text[:120])
-        except Exception:
+        except Exception as e:
             print("[NETTEST ERROR]", traceback.format_exc())
-            lines.append(f"❌ Binance: {traceback.format_exc().splitlines()[-1]}")
+            lines.append(f"❌ Binance: {e}")
 
         lines.append("")
 
-        # 3. yfinance
-        try:
-            import yfinance as yf
-            t  = yf.Ticker("AAPL")
-            df = t.history(period="5d", interval="1d")
-            if df is not None and not df.empty:
-                close = float(df['Close'].iloc[-1])
-                lines.append(f"✅ yfinance:")
-                lines.append(f"AAPL close={close:.2f}")
-            else:
-                lines.append("❌ yfinance: 빈 데이터")
-        except Exception:
-            print("[NETTEST ERROR]", traceback.format_exc())
-            lines.append(f"❌ yfinance: {traceback.format_exc().splitlines()[-1]}")
-
-        lines.append("")
-
-        # 4. 서버 IP
+        # 3. 서버 IP
         try:
             r = req.get("https://httpbin.org/ip", timeout=10)
-            lines.append(f"🌍 Server IP:")
-            lines.append(r.text.strip()[:120])
-        except Exception:
+            lines.append("🌍 Server IP:")
+            lines.append(r.text.strip()[:80])
+        except Exception as e:
             print("[NETTEST ERROR]", traceback.format_exc())
-            lines.append(f"❌ httpbin: {traceback.format_exc().splitlines()[-1]}")
+            lines.append(f"❌ httpbin: {e}")
 
         return "\n".join(lines)
 

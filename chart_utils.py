@@ -1,13 +1,12 @@
 """
 chart_utils.py
-Bybit REST API + yfinance + pykrx 캔들스틱 차트 생성 유틸리티.
-단일 axes, 캔들만 표시 — 볼륨 / MA / 52W 라인 / legend 없음.
+Bybit v5 + Binance REST API + yfinance(미국주식) + pykrx(한국주식)
+캔들스틱 차트 생성 유틸리티.
 """
 
 import logging
 import tempfile
 from datetime import date, datetime, timedelta
-from io import StringIO
 
 import requests
 import pandas as pd
@@ -29,22 +28,18 @@ _TIMEFRAME_DATE_FMT = {
     '5m':  '%H:%M',
 }
 
-# Bybit v5 interval 변환표
 _BYBIT_INTERVAL = {
-    '1d':  'D',
-    '1h':  '60',
-    '4h':  '240',
-    '15m': '15',
-    '5m':  '5',
+    '1d': 'D', '1h': '60', '4h': '240', '15m': '15', '5m': '5',
 }
 
-# yfinance interval/period 변환표
-_YF_PARAMS = {
-    '1d':  ('1d',  '1y'),
-    '1h':  ('1h',  '30d'),
-    '4h':  ('1h',  '60d'),
-    '15m': ('15m', '7d'),
-    '5m':  ('5m',  '5d'),
+_BINANCE_INTERVAL = {
+    '1d': '1d', '1h': '1h', '4h': '4h', '15m': '15m', '5m': '5m',
+}
+
+# yfinance 미국주식 전용
+_YF_US_PARAMS = {
+    '1d': ('1d', '1y'),
+    '1h': ('1h', '30d'),
 }
 
 
@@ -92,229 +87,150 @@ def _change_line(current: float, prev: float, fmt_fn=None) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# Bybit REST API (코인 /ac /ap)
+# 심볼 변환
 # ═══════════════════════════════════════════════════
 
-def _base_from_symbol(symbol: str) -> str:
-    """'BTC/USDT' → 'BTC'"""
-    return symbol.split('/')[0].upper()
-
-
-def _to_bybit_perps_symbol(user_input: str) -> str:
-    """
-    사용자 입력을 Bybit perps symbol로 변환.
-    BTC / btc / BTC/USDT / BTCUSDT → 모두 'BTCUSDT'
-    """
+def _to_usdt_symbol(user_input: str) -> str:
+    """BTC / btc / BTC/USDT / BTCUSDT → 'BTCUSDT'"""
     s = user_input.upper().strip()
-    if '/' in s:              # BTC/USDT → BTC
+    if '/' in s:
         s = s.split('/')[0]
-    if s.endswith('USDT'):    # BTCUSDT → 그대로
+    if s.endswith('USDT'):
         return s
-    return s + 'USDT'         # BTC → BTCUSDT
+    return s + 'USDT'
 
+
+# ═══════════════════════════════════════════════════
+# Bybit v5 kline
+# ═══════════════════════════════════════════════════
 
 def _bybit_kline(category: str, symbol: str, timeframe: str, limit: int = 365):
     """
-    Bybit v5 /market/kline 직접 호출.
-    성공 시 DataFrame(open/high/low/close, DatetimeIndex UTC), 실패 시 None.
+    Bybit v5 /market/kline.
+    category: 'spot' | 'linear'
+    Returns DataFrame(open/high/low/close, DatetimeIndex UTC) or None.
     """
     interval = _BYBIT_INTERVAL.get(timeframe, 'D')
-    url = "https://api.bybit.com/v5/market/kline"
     params = {
-        "category": category,
-        "symbol":   symbol,
-        "interval": interval,
-        "limit":    limit,
+        "category": category, "symbol": symbol,
+        "interval": interval, "limit":  limit,
     }
-    label = f"Bybit {category} {symbol}"
-    print(f"[AC TRY] {label} {timeframe}")
-
     try:
-        r = requests.get(url, params=params, timeout=20)
-        print(f"[BYBIT STATUS] {r.status_code} {r.text[:300]}")
-
+        r = requests.get("https://api.bybit.com/v5/market/kline", params=params, timeout=15)
         if r.status_code != 200:
-            print(f"[AC FAIL] {label} HTTP {r.status_code}")
             return None
-
         data = r.json()
         if data.get('retCode') != 0:
-            print(f"[AC FAIL] {label} retCode={data.get('retCode')} msg={data.get('retMsg')}")
             return None
-
         rows = data.get('result', {}).get('list', [])
         if not rows:
-            print(f"[AC FAIL] {label} empty list")
             return None
-
-        # list 는 최신순 → timestamp 오름차순 정렬
-        rows = sorted(rows, key=lambda x: int(x[0]))
-
-        df = pd.DataFrame(
-            rows,
-            columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'],
-        )
+        rows = sorted(rows, key=lambda x: int(x[0]))  # 최신순 → 오름차순
+        df = pd.DataFrame(rows, columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
         df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
         df.index.name = 'timestamp'
-
         for col in ['open', 'high', 'low', 'close']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-
         df = df[['open', 'high', 'low', 'close']].dropna()
-
-        if df.empty:
-            print(f"[AC FAIL] {label} empty after conversion")
-            return None
-
-        print(f"[AC OK] {label} rows={len(df)}")
-        return df
-
-    except Exception as e:
-        print(f"[AC FAIL] {label} {e}")
-        logger.warning("[AC FAIL] %s: %s", label, e)
+        return df if not df.empty else None
+    except Exception:
         return None
 
 
-def _fetch_spot(symbol: str, timeframe: str, limit: int = 365):
+# ═══════════════════════════════════════════════════
+# Binance kline
+# ═══════════════════════════════════════════════════
+
+def _binance_kline(market: str, symbol: str, timeframe: str, limit: int = 365):
     """
-    /ac: Bybit spot → Bybit perps
-    Returns (df, label) or (None, None).
+    Binance kline.
+    market: 'spot' → api.binance.com | 'futures' → fapi.binance.com
+    Returns DataFrame or None.
     """
-    base         = _base_from_symbol(symbol)
-    bybit_symbol = f"{base}USDT"
-
-    df = _bybit_kline('spot', bybit_symbol, timeframe, limit)
-    if df is not None:
-        return df, 'Bybit spot'
-
-    df = _bybit_kline('linear', bybit_symbol, timeframe, limit)
-    if df is not None:
-        return df, 'Bybit perps'
-
-    return None, None
-
-
-def _fetch_perps(symbol: str, timeframe: str, limit: int = 365):
-    """
-    /ap: Bybit perps only  (내부 호환용, create_perps_chart는 _fetch_perps_ap 사용)
-    Returns (df, label) or (None, None).
-    """
-    base         = _base_from_symbol(symbol)
-    bybit_symbol = f"{base}USDT"
-
-    df = _bybit_kline('linear', bybit_symbol, timeframe, limit)
-    if df is not None:
-        return df, 'Bybit perps'
-
-    return None, None
-
-
-def _fetch_perps_ap(symbol: str, timeframe: str, limit: int = 365):
-    """
-    /ap 전용: Bybit v5 linear kline 직접 호출.
-    symbol = 'BTC/USDT', 'BTC', 'BTCUSDT', 'btc' 모두 허용.
-    Returns (df, None) on success, (None, err_msg) on failure.
-    """
-    bybit_symbol = _to_bybit_perps_symbol(symbol)
-    interval     = _BYBIT_INTERVAL.get(timeframe, 'D')
-    url          = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol":   bybit_symbol,
-        "interval": interval,
-        "limit":    limit,
-    }
-
+    interval = _BINANCE_INTERVAL.get(timeframe, '1d')
+    url = (
+        "https://api.binance.com/api/v3/klines" if market == 'spot'
+        else "https://fapi.binance.com/fapi/v1/klines"
+    )
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        r = requests.get(url, params=params, timeout=20)
-        print(f"[AP BYBIT URL] {r.url}")
-        print(f"[AP BYBIT STATUS] {r.status_code}")
-        print(f"[AP BYBIT BODY] {r.text[:500]}")
-
+        r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-
-        data = r.json()
-        if data.get('retCode') != 0:
-            print(f"[AP BYBIT ERROR] {data}")
-            return None, data.get('retMsg', 'unknown error')
-
-        rows = data.get('result', {}).get('list', [])
-        if not rows:
-            return None, "empty list"
-
-        # Bybit 는 최신순 → timestamp 오름차순 정렬
-        rows = sorted(rows, key=lambda x: int(x[0]))
-
+            return None
+        rows = r.json()
+        if not rows or not isinstance(rows, list):
+            return None
+        # Binance는 이미 오름차순
         df = pd.DataFrame(
-            rows,
-            columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'],
+            [[row[0], row[1], row[2], row[3], row[4]] for row in rows],
+            columns=['ts', 'open', 'high', 'low', 'close'],
         )
         df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
         df.index.name = 'timestamp'
-
         for col in ['open', 'high', 'low', 'close']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-
         df = df[['open', 'high', 'low', 'close']].dropna()
-
-        if df.empty:
-            return None, "empty after conversion"
-
-        print(f"[AP BYBIT OK] {bybit_symbol} timeframe={timeframe} rows={len(df)}")
-        return df, None
-
-    except Exception as e:
-        print(f"[AP BYBIT FAIL] {e}")
-        logger.warning("[AP BYBIT FAIL] %s %s: %s", symbol, timeframe, e)
-        return None, str(e)
+        return df if not df.empty else None
+    except Exception:
+        return None
 
 
 # ═══════════════════════════════════════════════════
-# yfinance (코인 fallback + 미국 주식)
+# /ac: 코인 현물 조회 (Bybit spot → perps → Binance spot → futures)
 # ═══════════════════════════════════════════════════
 
-def _fetch_crypto_yf(symbol: str, timeframe: str):
-    """
-    코인 Bybit API 전체 실패 시 yfinance fallback.
-    'BTC/USDT' → 'BTC-USD'
-    Returns (df, 'yfinance') or raises Exception.
-    """
-    import yfinance as yf
-
-    base      = _base_from_symbol(symbol)
-    yf_symbol = f"{base}-USD"
-    interval, period = _YF_PARAMS.get(timeframe, ('1d', '1y'))
-
-    # 1. Ticker.history
-    print(f"[AC TRY] yfinance.Ticker {yf_symbol} {timeframe}")
-    try:
-        t  = yf.Ticker(yf_symbol)
-        df = t.history(period=period, interval=interval)
-        df = _normalize_yf_df(df)
-        if df is not None:
-            print(f"[AC OK] yfinance.Ticker {yf_symbol} rows={len(df)}")
-            return df, 'yfinance'
-    except Exception as e:
-        print(f"[AC FAIL] yfinance.Ticker {yf_symbol} {e}")
-
-    # 2. download
-    print(f"[AC TRY] yfinance.download {yf_symbol} {timeframe}")
-    try:
-        data = yf.download(yf_symbol, period=period, interval=interval,
-                           progress=False, auto_adjust=False)
-        df = _normalize_yf_df(data)
-        if df is not None:
-            print(f"[AC OK] yfinance.download {yf_symbol} rows={len(df)}")
-            return df, 'yfinance'
-    except Exception as e:
-        print(f"[AC FAIL] yfinance.download {yf_symbol} {e}")
-
-    raise ValueError(f"yfinance 코인 조회 실패: {yf_symbol}")
+def _fetch_spot(symbol: str, timeframe: str, limit: int = 365):
+    """Returns (df, source_name) or (None, None)."""
+    sym = _to_usdt_symbol(symbol)
+    sources = [
+        ("Bybit spot",      lambda: _bybit_kline('spot',    sym, timeframe, limit)),
+        ("Bybit perps",     lambda: _bybit_kline('linear',  sym, timeframe, limit)),
+        ("Binance spot",    lambda: _binance_kline('spot',   sym, timeframe, limit)),
+        ("Binance futures", lambda: _binance_kline('futures', sym, timeframe, limit)),
+    ]
+    for name, fn in sources:
+        print("[AC TRY]", name, sym)
+        try:
+            df = fn()
+            if df is not None:
+                print("[AC OK]", name)
+                return df, name
+            print("[AC FAIL]", name, "no data")
+        except Exception as e:
+            print("[AC FAIL]", name, e)
+    return None, None
 
 
-def _normalize_yf_df(data) -> pd.DataFrame | None:
-    """yfinance DataFrame → open/high/low/close 소문자 컬럼, UTC tz."""
+# ═══════════════════════════════════════════════════
+# /ap: 코인 선물 조회 (Bybit perps → Binance futures)
+# ═══════════════════════════════════════════════════
+
+def _fetch_perps_ap(symbol: str, timeframe: str, limit: int = 365):
+    """Returns (df, source_name) or (None, None)."""
+    sym = _to_usdt_symbol(symbol)
+    sources = [
+        ("Bybit perps",     lambda: _bybit_kline('linear',  sym, timeframe, limit)),
+        ("Binance futures", lambda: _binance_kline('futures', sym, timeframe, limit)),
+    ]
+    for name, fn in sources:
+        print("[AP TRY]", name, sym)
+        try:
+            df = fn()
+            if df is not None:
+                print("[AP OK]", name)
+                return df, name
+            print("[AP FAIL]", name, "no data")
+        except Exception as e:
+            print("[AP FAIL]", name, e)
+    return None, None
+
+
+# ═══════════════════════════════════════════════════
+# /au: 미국주식 (yfinance only)
+# ═══════════════════════════════════════════════════
+
+def _normalize_yf_df(data) -> 'pd.DataFrame | None':
+    """yfinance df → open/high/low/close 소문자, UTC tz."""
     if data is None or data.empty:
         return None
     if isinstance(data.columns, pd.MultiIndex):
@@ -330,76 +246,23 @@ def _normalize_yf_df(data) -> pd.DataFrame | None:
 
 
 def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
-    """
-    미국 주식 yfinance 조회.
-    Ticker.history → download 순서로 시도.
-    """
+    """yfinance 미국주식 조회. 실패 시 ValueError."""
     import yfinance as yf
-
-    interval, period = _YF_PARAMS.get(timeframe, ('1d', '1y'))
-
-    # 1. Ticker.history
-    print(f"[AU TRY] yfinance.Ticker {ticker} {timeframe}")
+    interval, period = _YF_US_PARAMS.get(timeframe, ('1d', '1y'))
+    print("[AU TRY]", ticker)
     try:
-        t  = yf.Ticker(ticker)
-        df = t.history(period=period, interval=interval)
-        df = _normalize_yf_df(df)
+        raw = yf.Ticker(ticker).history(period=period, interval=interval)
+        df  = _normalize_yf_df(raw)
         if df is not None:
-            print(f"[AU OK] yfinance.Ticker {ticker} rows={len(df)}")
+            print("[AU OK]", ticker)
             return df
-    except Exception as e:
-        print(f"[AU FAIL] yfinance.Ticker {ticker} {e}")
-
-    # 2. download
-    print(f"[AU TRY] yfinance.download {ticker} {timeframe}")
-    try:
-        data = yf.download(ticker, period=period, interval=interval,
-                           progress=False, auto_adjust=False)
-        df = _normalize_yf_df(data)
-        if df is not None:
-            print(f"[AU OK] yfinance.download {ticker} rows={len(df)}")
-            return df
-    except Exception as e:
-        print(f"[AU FAIL] yfinance.download {ticker} {e}")
-
-    raise ValueError(f"yfinance 미국주식 조회 실패: {ticker}")
-
-
-def _fetch_us_stooq(ticker: str) -> pd.DataFrame:
-    """Stooq daily CSV fallback (일봉만 지원)."""
-    stooq_symbol = ticker.lower() + '.us'
-    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-
-    print(f"[AU TRY] Stooq {ticker}")
-    try:
-        r = requests.get(url, timeout=20)
-        print(f"[STOOQ STATUS] {r.status_code} {r.text[:200]}")
-
-        if r.status_code != 200:
-            raise ValueError(f"Stooq HTTP {r.status_code}")
-
-        df = pd.read_csv(StringIO(r.text))
-        if df.empty or 'Date' not in df.columns:
-            raise ValueError("Stooq 응답 파싱 실패")
-
-        df = df.rename(columns={
-            'Date': 'timestamp', 'Open': 'open',
-            'High': 'high', 'Low': 'low', 'Close': 'close',
-        })
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        df = df.set_index('timestamp').sort_index()
-        df = df[['open', 'high', 'low', 'close']].dropna()
-
-        if df.empty:
-            raise ValueError(f"Stooq 유효 데이터 없음: {ticker}")
-
-        print(f"[AU OK] Stooq {ticker} rows={len(df)}")
-        return df
-
-    except Exception as e:
-        print(f"[AU FAIL] Stooq {ticker} {e}")
-        logger.warning("[AU FAIL] Stooq %s: %s", ticker, e)
+        print("[AU FAIL]", "empty data")
+        raise ValueError(f"yfinance 빈 데이터: {ticker}")
+    except ValueError:
         raise
+    except Exception as e:
+        print("[AU FAIL]", e)
+        raise ValueError(f"yfinance 조회 실패: {ticker}") from e
 
 
 # ═══════════════════════════════════════════════════
@@ -710,60 +573,39 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
 # ═══════════════════════════════════════════════════
 
 def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """
-    /ac: Bybit spot → Bybit perps → yfinance fallback
-    """
+    """/ac: Bybit spot → Bybit perps → Binance spot → Binance futures"""
     result = {
         'success': False, 'file_path': None, 'current_price': None,
         'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        # 1. Bybit REST API
         df, exchange_name = _fetch_spot(symbol, timeframe, 365)
-
-        # 2. yfinance fallback
         if df is None:
-            print(f"[AC FALLBACK] Bybit 실패 → yfinance: {symbol}")
-            try:
-                df, exchange_name = _fetch_crypto_yf(symbol, timeframe)
-            except Exception as yf_err:
-                print(f"[AC FALLBACK FAIL] yfinance: {yf_err}")
-                result['error'] = (
-                    f"해당 코인 데이터를 가져올 수 없습니다: {symbol.split('/')[0]}\n"
-                    f"시도: Bybit spot, Bybit perps, yfinance"
-                )
-                return result
+            sym = _to_usdt_symbol(symbol)
+            result['error'] = (
+                f"해당 코인 데이터를 가져올 수 없습니다: {sym}\n"
+                f"시도: Bybit spot, Bybit perps, Binance spot, Binance futures"
+            )
+            return result
 
         result['exchange'] = exchange_name
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저
         high_52w = low_52w = None
         if timeframe == '1d':
-            # 이미 365일치 있으므로 그대로 사용
-            high_52w = float(df['high'].max())
-            low_52w  = float(df['low'].min())
-        elif exchange_name == 'yfinance':
-            # yfinance는 1y 데이터
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
-            # 비일봉: 1d 365봉 별도 조회
             df_1d, _ = _fetch_spot(symbol, '1d', 365)
-            if df_1d is None:
-                try:
-                    df_1d, _ = _fetch_crypto_yf(symbol, '1d')
-                except Exception:
-                    df_1d = None
             if df_1d is not None:
                 high_52w = float(df_1d['high'].max())
                 low_52w  = float(df_1d['low'].min())
 
-        base  = symbol.split('/')[0] + 'USDT'
-        title = f"{base} - {timeframe.upper()} - {exchange_name}"
+        sym   = _to_usdt_symbol(symbol)
+        title = f"{sym} - {timeframe.upper()} - {exchange_name}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
@@ -790,47 +632,45 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """
-    /ap: Bybit perps only (category=linear, _fetch_perps_ap 사용)
-    """
-    bybit_symbol = _to_bybit_perps_symbol(symbol)
-    base_name    = bybit_symbol.replace('USDT', '')   # 'BTC'
+    """/ap: Bybit perps → Binance futures"""
+    sym       = _to_usdt_symbol(symbol)
+    base_name = sym.replace('USDT', '')
 
     result = {
         'success': False, 'file_path': None, 'current_price': None,
-        'symbol': symbol, 'timeframe': timeframe, 'exchange': 'Bybit perps',
+        'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        df, err_msg = _fetch_perps_ap(symbol, timeframe, 365)
+        df, exchange_name = _fetch_perps_ap(symbol, timeframe, 365)
         if df is None:
             result['error'] = (
                 f"해당 선물 데이터를 가져올 수 없습니다: {base_name}\n"
-                f"Bybit 응답: {err_msg}"
+                f"시도: Bybit perps, Binance futures"
             )
             return result
 
+        result['exchange'] = exchange_name
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저
         high_52w = low_52w = None
         if timeframe == '1d':
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
-            df_1d, err_1d = _fetch_perps_ap(symbol, '1d', 365)
+            df_1d, _ = _fetch_perps_ap(symbol, '1d', 365)
             if df_1d is not None:
                 high_52w = float(df_1d['high'].max())
                 low_52w  = float(df_1d['low'].min())
 
-        title    = f"{bybit_symbol} - {timeframe.upper()} - Bybit perps"
+        title    = f"{sym} - {timeframe.upper()} - {exchange_name}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {bybit_symbol} 차트 ({timeframe})\n",
+            f"📊 {sym} 차트 ({timeframe})\n",
             f"현재가: {format_price(current_price)} USDT",
             f"전일대비: {_change_line(current_price, prev_price)}",
         ]
@@ -852,13 +692,11 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
-    """
-    /au: yfinance (Ticker.history → download) → Stooq fallback
-    """
+    """/au: yfinance only"""
     ticker = ticker.upper().strip()
     result = {
         'success': False, 'file_path': None, 'current_price': None,
-        'symbol': ticker, 'timeframe': timeframe, 'exchange': 'US',
+        'symbol': ticker, 'timeframe': timeframe, 'exchange': 'yfinance',
         'error': None, 'currency': '$', 'caption': '',
     }
 
@@ -867,65 +705,30 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         return result
 
     try:
-        df          = None
-        used_source = None
-        used_tf     = timeframe
-
-        # 1. yfinance
-        try:
-            df          = _fetch_us_yf(ticker, timeframe)
-            used_source = 'yfinance'
-        except Exception as e:
-            print(f"[AU] yfinance 전체 실패: {e}")
-
-        # 2. Stooq fallback (일봉만)
-        if df is None:
-            try:
-                df          = _fetch_us_stooq(ticker)
-                used_source = 'Stooq'
-                used_tf     = '1d'
-                if timeframe == '1h':
-                    logger.info("[AU] 1h 실패, Stooq 일봉으로 대체: %s", ticker)
-            except Exception as e:
-                print(f"[AU] Stooq 실패: {e}")
-
-        if df is None:
-            result['error'] = (
-                f"미국 주식 데이터를 가져올 수 없습니다: {ticker}\n"
-                f"시도: yfinance, Stooq"
-            )
-            return result
+        df = _fetch_us_yf(ticker, timeframe)
 
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저
         high_52w = low_52w = None
-        if used_tf == '1d':
-            # 1y 데이터 → 그대로 사용
+        if timeframe == '1d':
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
-            # 1h → 1d 데이터 별도 조회
             try:
                 df_1d    = _fetch_us_yf(ticker, '1d')
                 high_52w = float(df_1d['high'].max())
                 low_52w  = float(df_1d['low'].min())
             except Exception:
-                try:
-                    df_1d    = _fetch_us_stooq(ticker)
-                    high_52w = float(df_1d['high'].max())
-                    low_52w  = float(df_1d['low'].min())
-                except Exception:
-                    pass
+                pass
 
-        title    = f"{ticker} - {used_tf.upper()} - {used_source}"
+        title    = f"{ticker} - {timeframe.upper()} - yfinance"
         tmp_path = _make_tmp_path()
-        _draw_chart(df, title, used_tf, tmp_path)
+        _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {ticker} 차트 ({used_tf})\n",
+            f"📊 {ticker} 차트 ({timeframe})\n",
             f"현재가: {_fmt_us(current_price)} USD",
             f"전일대비: {_change_line(current_price, prev_price, _fmt_us)}",
         ]
