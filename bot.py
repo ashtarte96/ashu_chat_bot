@@ -47,7 +47,7 @@ from telegram.ext import (
 
 from database import Database
 from chart_utils import (
-    create_clean_candlestick_chart,
+    get_crypto_data,
     create_perps_chart,
     create_kr_stock_chart,
     create_us_stock_chart,
@@ -55,6 +55,7 @@ from chart_utils import (
     normalize_symbol,
     format_price,
     VALID_INTERVALS,
+    _fmt_large,
 )
 
 # ═══════════════════════════════════════════════════
@@ -864,47 +865,59 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ═══════════════════════════════════════════════════
-# /ac 명령어 (캔들스틱 차트)
+# /ac 명령어 (CoinMarketCap 현재가)
 # ═══════════════════════════════════════════════════
 
 async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /ac 티커           → 일봉(1d) 차트
-    /ac 티커 인터벌    → 지정 인터벌 차트
-    지원 인터벌: 1d, 1h, 4h, 15m, 5m
-    """
+    """/ac 티커 → CoinMarketCap 현재가·시가총액·변동률"""
     if not update.message:
         return
 
     if not context.args:
         await update.message.reply_text(
-            "형식: /ac 티커 [인터벌]\n"
-            "예시: /ac BTC  /  /ac ETH 1h  /  /ac BTC 4h\n"
-            f"지원 인터벌: {', '.join(sorted(VALID_INTERVALS))}"
+            "형식: /ac 티커\n"
+            "예시: /ac BTC  /  /ac ETH  /  /ac SOL"
         )
         return
 
     ticker = context.args[0].upper()
-    timeframe = context.args[1].lower() if len(context.args) >= 2 else '1d'
+    processing_msg = await update.message.reply_text(f"조회 중... {ticker}")
 
-    if timeframe not in VALID_INTERVALS:
-        await update.message.reply_text(
-            f"지원하지 않는 인터벌입니다: {timeframe}\n"
-            f"지원 인터벌: {', '.join(sorted(VALID_INTERVALS))}"
-        )
-        return
-
-    symbol = normalize_symbol(ticker)
-    processing_msg = await update.message.reply_text(f"차트 생성 중... {symbol} ({timeframe})")
-
-    result = create_clean_candlestick_chart(symbol, timeframe)
+    data = await asyncio.to_thread(get_crypto_data, ticker)
 
     try:
         await processing_msg.delete()
     except Exception:
         pass
 
-    await _send_chart_result(update, result)
+    if data is None:
+        await update.message.reply_text(
+            f"데이터를 가져올 수 없습니다: {ticker}\n"
+            "Railway Variables에 CMC_API_KEY가 설정되어 있는지 확인해주세요."
+        )
+        return
+
+    price      = data['price']
+    ch_24h     = data['change_24h']
+    ch_1h      = data['change_1h']
+    ch_7d      = data['change_7d']
+    market_cap = data['market_cap']
+    volume     = data['volume_24h']
+    rank       = data['rank']
+
+    def _pct(v: float) -> str:
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.2f}%"
+
+    rank_str = f"#{rank}" if rank else "N/A"
+    text = (
+        f"📊 {data['name']} ({data['symbol']}) {rank_str}\n\n"
+        f"💰 현재가: ${format_price(price)}\n"
+        f"📈 1H: {_pct(ch_1h)}  |  24H: {_pct(ch_24h)}  |  7D: {_pct(ch_7d)}\n"
+        f"🏦 시가총액: {_fmt_large(market_cap)}\n"
+        f"💹 24H 거래량: {_fmt_large(volume)}"
+    )
+    await update.message.reply_text(text)
 
 
 # ═══════════════════════════════════════════════════
@@ -1122,10 +1135,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/unmute → 답글로 mute 해제\n"
         "/unmute user_id → 직접 해제\n"
         "\n"
-        "📈 차트\n"
-        "/ac BTC → 코인 차트 (현물, 없으면 PERPS)\n"
-        "/ac BTC 1h → 인터벌 지정\n"
-        "/ap BTC → 코인 선물 차트\n"
+        "📈 시세 / 차트\n"
+        "/ac BTC → 코인 현재가·변동률·시가총액 (CoinMarketCap)\n"
+        "/ap BTC → 코인 선물 차트 (Bybit/Binance)\n"
         "/ak 삼성전자 → 한국 주식\n"
         "/ak 005930 → 종목코드 조회\n"
         "/au AAPL → 미국 주식\n"

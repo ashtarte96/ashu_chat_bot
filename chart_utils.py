@@ -1,10 +1,10 @@
 """
 chart_utils.py
-Bybit v5 + Binance REST API + yfinance(미국주식) + pykrx(한국주식)
-캔들스틱 차트 생성 유틸리티.
+CoinMarketCap(코인 시세) + Bybit/Binance(선물) + yfinance(미국주식) + pykrx(한국주식)
 """
 
 import logging
+import os
 import tempfile
 from datetime import date, datetime, timedelta
 
@@ -84,6 +84,85 @@ def _change_line(current: float, prev: float, fmt_fn=None) -> str:
     if change >= 0:
         return f"+{abs_ch} (+{pct:.2f}%)"
     return f"-{abs_ch} (-{abs(pct):.2f}%)"
+
+
+# ═══════════════════════════════════════════════════
+# CoinMarketCap API (/ac 코인 현재가)
+# ═══════════════════════════════════════════════════
+
+_CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+
+
+def _to_cmc_symbol(user_input: str) -> str:
+    """BTC / btc / BTC/USDT / BTCUSDT → 'BTC'"""
+    s = user_input.upper().strip()
+    if '/' in s:
+        s = s.split('/')[0]
+    if s.endswith('USDT'):
+        s = s[:-4]
+    return s
+
+
+def _fmt_large(value: float) -> str:
+    """시가총액/거래량 축약 포맷 ($1.57T, $28.3B ...)"""
+    if value >= 1e12:
+        return f"${value / 1e12:.2f}T"
+    if value >= 1e9:
+        return f"${value / 1e9:.2f}B"
+    if value >= 1e6:
+        return f"${value / 1e6:.2f}M"
+    return f"${value:,.2f}"
+
+
+def get_crypto_data(symbol: str) -> dict | None:
+    """
+    CoinMarketCap quotes/latest 호출.
+    환경변수 CMC_API_KEY 필요.
+    Returns dict or None.
+    """
+    api_key = os.getenv("CMC_API_KEY")
+    if not api_key:
+        print("[CMC FAIL] CMC_API_KEY not set")
+        return None
+
+    sym = _to_cmc_symbol(symbol)
+    headers = {
+        "Accepts": "application/json",
+        "X-CMC_PRO_API_KEY": api_key,
+    }
+    params = {"symbol": sym, "convert": "USD"}
+
+    print("[CMC TRY]", sym)
+    try:
+        r = requests.get(_CMC_URL, headers=headers, params=params, timeout=10)
+        data = r.json()
+
+        if "data" not in data or sym not in data["data"]:
+            err = data.get("status", {}).get("error_message", "unknown")
+            print("[CMC FAIL]", sym, err)
+            return None
+
+        coin  = data["data"][sym]
+        quote = coin["quote"]["USD"]
+
+        result = {
+            "name":       coin["name"],
+            "symbol":     coin["symbol"],
+            "rank":       coin.get("cmc_rank"),
+            "price":      quote["price"],
+            "change_1h":  quote.get("percent_change_1h", 0.0),
+            "change_24h": quote["percent_change_24h"],
+            "change_7d":  quote.get("percent_change_7d", 0.0),
+            "market_cap": quote.get("market_cap", 0.0),
+            "volume_24h": quote.get("volume_24h", 0.0),
+        }
+        print("[CMC OK]", sym, f"price={result['price']:.4f}")
+        return result
+
+    except Exception as e:
+        print("[CMC FAIL]", sym, e)
+        logger.warning("[CMC FAIL] %s: %s", sym, e)
+        return None
 
 
 # ═══════════════════════════════════════════════════
@@ -173,32 +252,6 @@ def _binance_kline(market: str, symbol: str, timeframe: str, limit: int = 365):
         return df if not df.empty else None
     except Exception:
         return None
-
-
-# ═══════════════════════════════════════════════════
-# /ac: 코인 현물 조회 (Bybit spot → perps → Binance spot → futures)
-# ═══════════════════════════════════════════════════
-
-def _fetch_spot(symbol: str, timeframe: str, limit: int = 365):
-    """Returns (df, source_name) or (None, None)."""
-    sym = _to_usdt_symbol(symbol)
-    sources = [
-        ("Bybit spot",      lambda: _bybit_kline('spot',    sym, timeframe, limit)),
-        ("Bybit perps",     lambda: _bybit_kline('linear',  sym, timeframe, limit)),
-        ("Binance spot",    lambda: _binance_kline('spot',   sym, timeframe, limit)),
-        ("Binance futures", lambda: _binance_kline('futures', sym, timeframe, limit)),
-    ]
-    for name, fn in sources:
-        print("[AC TRY]", name, sym)
-        try:
-            df = fn()
-            if df is not None:
-                print("[AC OK]", name)
-                return df, name
-            print("[AC FAIL]", name, "no data")
-        except Exception as e:
-            print("[AC FAIL]", name, e)
-    return None, None
 
 
 # ═══════════════════════════════════════════════════
@@ -571,65 +624,6 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
 # ═══════════════════════════════════════════════════
 # 공개 함수
 # ═══════════════════════════════════════════════════
-
-def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """/ac: Bybit spot → Bybit perps → Binance spot → Binance futures"""
-    result = {
-        'success': False, 'file_path': None, 'current_price': None,
-        'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
-        'error': None, 'currency': '$', 'caption': '',
-    }
-    try:
-        df, exchange_name = _fetch_spot(symbol, timeframe, 365)
-        if df is None:
-            sym = _to_usdt_symbol(symbol)
-            result['error'] = (
-                f"해당 코인 데이터를 가져올 수 없습니다: {sym}\n"
-                f"시도: Bybit spot, Bybit perps, Binance spot, Binance futures"
-            )
-            return result
-
-        result['exchange'] = exchange_name
-        current_price = float(df['close'].iloc[-1])
-        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
-        result['current_price'] = current_price
-
-        high_52w = low_52w = None
-        if timeframe == '1d':
-            high_52w = float(df['high'].max())
-            low_52w  = float(df['low'].min())
-        else:
-            df_1d, _ = _fetch_spot(symbol, '1d', 365)
-            if df_1d is not None:
-                high_52w = float(df_1d['high'].max())
-                low_52w  = float(df_1d['low'].min())
-
-        sym   = _to_usdt_symbol(symbol)
-        title = f"{sym} - {timeframe.upper()} - {exchange_name}"
-        tmp_path = _make_tmp_path()
-        _draw_chart(df, title, timeframe, tmp_path)
-
-        lines = [
-            f"📊 {symbol} 차트 ({timeframe})\n",
-            f"현재가: {format_price(current_price)} USDT",
-            f"전일대비: {_change_line(current_price, prev_price)}",
-        ]
-        if high_52w is not None:
-            lines.append(f"52주 최고가: {format_price(high_52w)} USDT")
-        if low_52w is not None:
-            lines.append(f"52주 최저가: {format_price(low_52w)} USDT")
-
-        result['success']   = True
-        result['file_path'] = tmp_path
-        result['caption']   = '\n'.join(lines)
-
-    except Exception as e:
-        logger.error("create_clean_candlestick_chart 오류: %s", e)
-        result['error'] = str(e)
-        plt.close('all')
-
-    return result
-
 
 def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
     """/ap: Bybit perps → Binance futures"""
