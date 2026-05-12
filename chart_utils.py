@@ -6,6 +6,7 @@ Binance REST API (primary) + Bybit v5 REST API (fallback)
 
 import difflib
 import logging
+import os
 import re
 import tempfile
 import traceback as tb
@@ -367,7 +368,11 @@ def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
         raise ValueError(f"yfinance 조회 실패: {ticker}") from e
 
 
-# ── Korean stocks (pykrx) ──────────────────────────────────────────────
+# ── Korean stocks ──────────────────────────────────────────────────────
+# Primary source : 상장법인목록.xls  (KRX official listing, placed in project root)
+# ETF fallback   : _STATIC_ETF_RAW  (Excel doesn't include ETFs)
+# Stock fallback : _STATIC_STOCK_RAW (used when Excel is absent)
+# -----------------------------------------------------------------------
 
 try:
     from rapidfuzz import process as _rf_process, fuzz as _rf_fuzz
@@ -375,23 +380,50 @@ try:
 except ImportError:
     _USE_RAPIDFUZZ = False
 
+# Path to KRX listing Excel (same directory as this file)
+_KRX_EXCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '상장법인목록.xls')
+
+# KRX 시장구분 → canonical market name
+_MARKET_MAP: dict = {
+    '유가':   'KOSPI',   # 유가증권시장 = KOSPI
+    '코스피': 'KOSPI',
+    '코스닥': 'KOSDAQ',
+    '코넥스': 'KONEX',
+}
+
+# Market → yfinance/log suffix  (pykrx always uses bare 6-digit codes)
+_MARKET_SUFFIX: dict = {
+    'KOSPI':  '.KS',
+    'KOSDAQ': '.KQ',
+    'KONEX':  '',
+    'ETF':    '.KS',
+}
+
 
 def _normalize_query(text: str) -> str:
     """NFC, remove spaces + special chars, lowercase.
-    e.g. 'TIGER 미국S&P500' → 'tiger미국sp500'
-         '두산 에너빌리티'   → '두산에너빌리티'
+    'TIGER 미국S&P500' → 'tiger미국sp500'
+    '두산 에너빌리티'  → '두산에너빌리티'
     """
     text = unicodedata.normalize('NFC', text)
     text = re.sub(r'[\s\-\_\./\(\)·&,]', '', text)
     return text.lower()
 
 
-# ── Static baseline: top stocks + popular ETFs ────────────────────────
-# Pre-seeded into the cache at startup — guarantees these always work
-# even when pykrx's listing API is unavailable (credentials / network).
-# Format: (ticker, display_name, market)
-_STATIC_ENTRIES_RAW = [
-    # ── KOSPI ──────────────────────────────────────────────────────────
+# ── Static ETFs (KRX 상장법인목록.xls does NOT include ETFs) ─────────────
+# Tickers verified via get_market_ohlcv_by_date()
+_STATIC_ETF_RAW = [
+    ('069500', 'KODEX 200',          'ETF'),
+    ('360750', 'TIGER 미국S&P500',   'ETF'),
+    ('305720', 'TIGER 2차전지테마',  'ETF'),
+    ('133690', 'TIGER 나스닥100',    'ETF'),
+    ('122630', 'KODEX 레버리지',     'ETF'),
+    ('114800', 'KODEX 인버스',       'ETF'),
+    ('229200', 'KODEX 코스닥150',    'ETF'),
+]
+
+# ── Static stock fallback (used only when Excel file is absent) ───────────
+_STATIC_STOCK_RAW = [
     ('005930', '삼성전자',           'KOSPI'),
     ('000660', 'SK하이닉스',         'KOSPI'),
     ('005380', '현대차',             'KOSPI'),
@@ -402,7 +434,7 @@ _STATIC_ENTRIES_RAW = [
     ('051910', 'LG화학',             'KOSPI'),
     ('068270', '셀트리온',           'KOSPI'),
     ('005490', 'POSCO홀딩스',        'KOSPI'),
-    ('003670', 'POSCO퓨처엠',        'KOSPI'),
+    ('003670', '포스코퓨처엠',       'KOSPI'),
     ('012330', '현대모비스',         'KOSPI'),
     ('105560', 'KB금융',             'KOSPI'),
     ('055550', '신한지주',           'KOSPI'),
@@ -422,67 +454,92 @@ _STATIC_ENTRIES_RAW = [
     ('000810', '삼성화재',           'KOSPI'),
     ('035420', 'NAVER',              'KOSPI'),
     ('035720', '카카오',             'KOSPI'),
-    ('011170', '롯데케미칼',         'KOSPI'),
-    ('006800', '미래에셋증권',       'KOSPI'),
-    ('039490', '키움증권',           'KOSPI'),
     ('030200', 'KT',                 'KOSPI'),
     ('017670', 'SK텔레콤',           'KOSPI'),
     ('003550', 'LG',                 'KOSPI'),
     ('096770', 'SK이노베이션',       'KOSPI'),
     ('033780', 'KT&G',               'KOSPI'),
     ('003490', '대한항공',           'KOSPI'),
-    ('034730', 'SK스퀘어',           'KOSPI'),
-    ('010950', 'S-Oil',              'KOSPI'),
-    ('316140', '우리금융지주',       'KOSPI'),
-    ('082640', '동원산업',           'KOSPI'),
-    # ── KOSDAQ ─────────────────────────────────────────────────────────
     ('086520', '에코프로',           'KOSDAQ'),
     ('247540', '에코프로비엠',       'KOSDAQ'),
     ('259960', '크래프톤',           'KOSDAQ'),
     ('293490', '카카오게임즈',       'KOSDAQ'),
     ('036570', '엔씨소프트',         'KOSDAQ'),
     ('352820', 'HYBE',               'KOSDAQ'),
-    ('091990', '셀트리온헬스케어',   'KOSDAQ'),
     ('263750', '펄어비스',           'KOSDAQ'),
-    ('041510', '에스엠',             'KOSDAQ'),
     ('035900', 'JYP Ent.',           'KOSDAQ'),
-    ('041510', 'SM엔터테인먼트',     'KOSDAQ'),
     ('122870', '와이지엔터테인먼트', 'KOSDAQ'),
-    # ── ETF (ticker verified via get_market_ohlcv_by_date) ─────────────
-    ('069500', 'KODEX 200',          'ETF'),
-    ('360750', 'TIGER 미국S&P500',   'ETF'),
-    ('305720', 'TIGER 2차전지테마',  'ETF'),
-    ('133690', 'TIGER 나스닥100',    'ETF'),
-    ('122630', 'KODEX 레버리지',     'ETF'),
-    ('114800', 'KODEX 인버스',       'ETF'),
-    ('229200', 'KODEX 코스닥150',    'ETF'),
 ]
 
-# Pre-normalize at module load — used to seed _krx_cache on first access
-_STATIC_ENTRIES = [
-    (t, n, _normalize_query(n), m) for t, n, m in _STATIC_ENTRIES_RAW
-]
 
-# Aliases: user-typed shorthand → canonical KRX display name.
-# The canonical name must exist (after normalization) in _STATIC_ENTRIES or KRX cache.
+def _load_krx_excel() -> list:
+    """
+    Load 상장법인목록.xls → [(ticker_6digit, name, market), ...]
+    KRX .xls files are HTML-disguised tables with EUC-KR encoding.
+    Returns empty list if file is absent or unreadable.
+    """
+    if not os.path.isfile(_KRX_EXCEL_PATH):
+        logger.warning("[KRX EXCEL] file not found: %s", _KRX_EXCEL_PATH)
+        return []
+    df = None
+    try:
+        tables = pd.read_html(_KRX_EXCEL_PATH, encoding='euc-kr')
+        df = tables[0] if tables else None
+    except Exception:
+        try:
+            df = pd.read_excel(_KRX_EXCEL_PATH, dtype=str)
+        except Exception as e:
+            logger.warning("[KRX EXCEL] read failed: %s", e)
+            return []
+
+    if df is None or df.empty:
+        return []
+
+    cols = {str(c).strip(): c for c in df.columns}
+    name_col = next((cols[c] for c in cols if '회사명' in c or '종목명' in c), None)
+    code_col  = next((cols[c] for c in cols if '종목코드' in c or '코드' in c), None)
+    mkt_col   = next((cols[c] for c in cols if '시장구분' in c or '시장' in c), None)
+
+    if not name_col or not code_col:
+        logger.warning("[KRX EXCEL] required columns not found: %s", list(df.columns))
+        return []
+
+    results = []
+    for _, row in df.iterrows():
+        raw_ticker = str(row[code_col]).strip().split('.')[0].zfill(6)
+        if not raw_ticker.isdigit() or len(raw_ticker) != 6:
+            continue
+        name = str(row[name_col]).strip()
+        if not name or name == 'nan':
+            continue
+        market = 'KOSPI'
+        if mkt_col:
+            mkt_raw = str(row[mkt_col]).strip()
+            market = _MARKET_MAP.get(mkt_raw, _MARKET_MAP.get(mkt_raw[:2], 'KOSPI'))
+        results.append((raw_ticker, name, market))
+
+    return results
+
+
+# Aliases: user-typed shorthand → canonical KRX display name (post-normalization).
+# Excel uses Korean "포스코퓨처엠" for 003670, English "POSCO홀딩스" for 005490.
 _KR_ALIASES_RAW: dict = {
-    # Abbreviations that can't substring-match the official KRX name
-    '삼전':           '삼성전자',
-    '삼바':           '삼성바이오로직스',
-    '한전':           '한국전력',
-    '엔솔':           'LG에너지솔루션',
-    '엘지엔솔':       'LG에너지솔루션',
-    'lg엔솔':         'LG에너지솔루션',
-    '에코비엠':       '에코프로비엠',
-    '두산':           '두산에너빌리티',   # user-defined alias
-    '포퓨엠':         'POSCO퓨처엠',
-    # Korean pronunciation → English-prefixed official KRX names
-    '네이버':         'NAVER',
-    '하이브':         'HYBE',
-    '포스코퓨처엠':   'POSCO퓨처엠',
-    '포스코퓨처':     'POSCO퓨처엠',
-    '포스코홀딩스':   'POSCO홀딩스',
-    '포스코':         'POSCO홀딩스',
+    '삼전':         '삼성전자',
+    '삼바':         '삼성바이오로직스',
+    '한전':         '한국전력공사',
+    '한국전력':     '한국전력공사',
+    '엔솔':         'LG에너지솔루션',
+    '엘지엔솔':     'LG에너지솔루션',
+    'lg엔솔':       'LG에너지솔루션',
+    '에코비엠':     '에코프로비엠',
+    '두산':         '두산에너빌리티',
+    '네이버':       'NAVER',
+    '하이브':       'HYBE',
+    '포스코퓨처엠': '포스코퓨처엠',   # explicit exact-match alias (Korean name in Excel)
+    '포스코퓨처':   '포스코퓨처엠',
+    '포퓨엠':       '포스코퓨처엠',
+    '포스코홀딩스': 'POSCO홀딩스',    # Excel uses English prefix for 005490
+    '포스코':       'POSCO홀딩스',
 }
 _KR_ALIASES: dict = {
     _normalize_query(k): _normalize_query(v)
@@ -490,37 +547,18 @@ _KR_ALIASES: dict = {
 }
 
 # KRX full-listing cache — rebuilt once per calendar day.
-#   by_norm   : {normalized_name: ticker}
-#   by_ticker : {ticker: (name, market)}
-#   entries   : [(ticker, name, norm, market)]
-#   norm_names: [norm, ...]  — for fuzzy input
-#   date      : 'YYYYMMDD'
 _krx_cache: dict = {
     'by_norm': {}, 'by_ticker': {}, 'entries': [], 'norm_names': [], 'date': '',
 }
 
 
-def get_latest_krx_date() -> str:
-    """Return the most recent KRX trading date (looks back up to 14 days)."""
-    try:
-        from pykrx import stock
-    except ImportError:
-        return datetime.now().strftime("%Y%m%d")
-    today = datetime.now()
-    for i in range(14):
-        d = today - timedelta(days=i)
-        date_str = d.strftime("%Y%m%d")
-        try:
-            tickers = stock.get_market_ticker_list(date=date_str, market="KOSPI")
-            if tickers:
-                return date_str
-        except Exception as e:
-            logger.warning("[KRX DATE] %s: %s", date_str, e)
-    return today.strftime("%Y%m%d")
-
-
-def _build_krx_cache(date_str: str) -> dict:
-    """Build cache: static entries always included; KRX API adds more when available."""
+def _build_krx_cache() -> dict:
+    """
+    Build cache from:
+      1. 상장법인목록.xls (KRX official Excel, ~2766 regular stocks)
+      2. Static ETF entries (Excel doesn't include ETFs)
+      3. Static stock fallback (only when Excel is absent)
+    """
     by_norm: dict   = {}
     by_ticker: dict = {}
     entries: list   = []
@@ -534,70 +572,37 @@ def _build_krx_cache(date_str: str) -> dict:
         if nn not in by_norm:
             by_norm[nn] = ticker
 
-    # ── Seed with static baseline (always works) ──────────────────────
-    for ticker, name, nn, market in _STATIC_ENTRIES:
+    # ── 1. KRX Excel (regular stocks) ────────────────────────────────
+    excel_rows = _load_krx_excel()
+    kospi_count = kosdaq_count = konex_count = 0
+    for ticker, name, market in excel_rows:
         _add(ticker, name, market)
-    static_count = len(entries)
-    print(f"[KRX CACHE] static baseline: {static_count} entries")
+        if market == 'KOSPI':    kospi_count  += 1
+        elif market == 'KOSDAQ': kosdaq_count += 1
+        elif market == 'KONEX':  konex_count  += 1
 
-    # ── Augment via pykrx listing API (may fail, that's OK) ───────────
-    try:
-        from pykrx import stock
-        for market in ('KOSPI', 'KOSDAQ', 'KONEX'):
-            try:
-                tickers = stock.get_market_ticker_list(date=date_str, market=market)
-                if not tickers:
-                    continue
-                logger.info("[KRX CACHE] %s API: %d tickers", market, len(tickers))
-                for ticker in tickers:
-                    try:
-                        n = stock.get_market_ticker_name(ticker)
-                        if isinstance(n, str):
-                            _add(ticker, n, market)
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning("[KRX CACHE] %s error: %s", market, e)
+    # ── 2. Static ETFs (not in Excel) ────────────────────────────────
+    etf_count = 0
+    for ticker, name, market in _STATIC_ETF_RAW:
+        before = len(entries)
+        _add(ticker, name, market)
+        if len(entries) > before:
+            etf_count += 1
 
-        # ETFs
-        try:
-            try:
-                etf_tickers = stock.get_etf_ticker_list(date_str)
-            except TypeError:
-                etf_tickers = stock.get_etf_ticker_list()
-            if etf_tickers:
-                logger.info("[KRX CACHE] ETF API: %d tickers", len(etf_tickers))
-                for ticker in etf_tickers:
-                    etf_name = None
-                    try:
-                        etf_name = stock.get_etf_ticker_name(ticker)
-                        if not isinstance(etf_name, str):
-                            etf_name = None
-                    except Exception:
-                        pass
-                    if not etf_name:
-                        try:
-                            etf_name = stock.get_market_ticker_name(ticker)
-                            if not isinstance(etf_name, str):
-                                etf_name = None
-                        except Exception:
-                            pass
-                    if etf_name:
-                        _add(ticker, etf_name, 'ETF')
-        except Exception as e:
-            logger.warning("[KRX CACHE] ETF error: %s", e)
+    # ── 3. Static stock fallback (only if Excel failed) ──────────────
+    if not excel_rows:
+        for ticker, name, market in _STATIC_STOCK_RAW:
+            _add(ticker, name, market)
 
-    except ImportError:
-        logger.error("[KRX CACHE] pykrx not installed")
+    total = len(entries)
+    print(f"[KRX CACHE] 총 {total}개: KOSPI={kospi_count} KOSDAQ={kosdaq_count} KONEX={konex_count} ETF={etf_count}")
 
-    api_count = len(entries) - static_count
-    print(f"[KRX CACHE] total {len(entries)} entries (static={static_count} api={api_count}) for {date_str}")
     return {
         'by_norm':    by_norm,
         'by_ticker':  by_ticker,
         'entries':    entries,
         'norm_names': [nn for _, _, nn, _ in entries],
-        'date':       date_str,
+        'date':       date.today().strftime('%Y%m%d'),
     }
 
 
@@ -607,20 +612,19 @@ def _get_krx_cache() -> dict:
     today = date.today().strftime('%Y%m%d')
     if _krx_cache['entries'] and _krx_cache['date'] == today:
         return _krx_cache
-    date_str = get_latest_krx_date()
-    _krx_cache = _build_krx_cache(date_str)
+    _krx_cache = _build_krx_cache()
     return _krx_cache
 
 
 def find_kr_stock(query: str):
     """
     Search a Korean stock or ETF by name, alias, or 6-digit ticker code.
-    Returns (ticker, name) for a unique match.
+    Returns (ticker_with_suffix, name) for a unique match.
     Returns (None, [(ticker, name), ...]) for multiple candidates.
     Returns (None, []) when nothing is found.
 
     Priority:
-      1. 6-digit code  → cache or pykrx direct name lookup
+      1. 6-digit code  → cache lookup
       2. Alias map     → resolve to canonical name → cache exact match
       3. Cache exact normalized match
       4. Cache contains match
@@ -630,25 +634,16 @@ def find_kr_stock(query: str):
     query_norm = _normalize_query(query_raw)
 
     def _suffix(market: str) -> str:
-        return '.KS' if market == 'KOSPI' else '.KQ' if market == 'KOSDAQ' else ''
-
-    print(f"[SEARCH] query={query_raw} normalized={query_norm}")
+        return _MARKET_SUFFIX.get(market, '')
 
     # ── 1. 6-digit code ───────────────────────────────────────────────
     if query_raw.isdigit() and len(query_raw) == 6:
         cache = _get_krx_cache()
         if query_raw in cache['by_ticker']:
             name, market = cache['by_ticker'][query_raw]
-            print(f"[SEARCH] matched={query_raw}{_suffix(market)} name={name}")
-            return query_raw, name
-        try:
-            from pykrx import stock as _s
-            n = _s.get_market_ticker_name(query_raw)
-            if isinstance(n, str) and n:
-                print(f"[SEARCH] matched={query_raw} name={n} (pykrx)")
-                return query_raw, n
-        except Exception as e:
-            logger.warning("[KRX] code lookup: %s %s", query_raw, e)
+            ticker_out = f"{query_raw}{_suffix(market)}"
+            print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+            return ticker_out, name
         return None, []
 
     cache = _get_krx_cache()
@@ -659,15 +654,17 @@ def find_kr_stock(query: str):
         ticker = cache['by_norm'].get(resolved_norm)
         if ticker:
             name, market = cache['by_ticker'][ticker]
-            print(f"[SEARCH] matched={ticker}{_suffix(market)} name={name} (alias)")
-            return ticker, name
+            ticker_out = f"{ticker}{_suffix(market)}"
+            print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+            return ticker_out, name
 
     # ── 3. Exact normalized match ─────────────────────────────────────
     ticker = cache['by_norm'].get(query_norm)
     if ticker:
         name, market = cache['by_ticker'][ticker]
-        print(f"[SEARCH] matched={ticker}{_suffix(market)} name={name} (exact)")
-        return ticker, name
+        ticker_out = f"{ticker}{_suffix(market)}"
+        print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+        return ticker_out, name
 
     # ── 4. Contains match ─────────────────────────────────────────────
     contains: list = [
@@ -675,18 +672,18 @@ def find_kr_stock(query: str):
         if query_norm in nn or nn in query_norm
     ]
     if contains:
-        print(f"[SEARCH] contains {len(contains)}: {contains[:3]}")
         if len(contains) == 1:
             t, n = contains[0]
             market = cache['by_ticker'][t][1]
-            print(f"[SEARCH] matched={t}{_suffix(market)} name={n} (contains)")
-            return t, n
+            ticker_out = f"{t}{_suffix(market)}"
+            print(f"[SEARCH]\nquery={query_raw}\nmatched={n}\nticker={ticker_out}")
+            return ticker_out, n
         return None, contains[:5]
 
     # ── 5. Fuzzy match ────────────────────────────────────────────────
     norm_names = cache['norm_names']
     if not norm_names:
-        print(f"[SEARCH] no match: {query_raw}")
+        print(f"[SEARCH]\nquery={query_raw}\nmatched=None\nticker=None")
         return None, []
 
     if _USE_RAPIDFUZZ:
@@ -707,15 +704,15 @@ def find_kr_stock(query: str):
                 fuzzy_results.append((t, n))
                 seen.add(t)
         fuzzy_results = fuzzy_results[:5]
-        print(f"[SEARCH] fuzzy: {fuzzy_results}")
         if len(fuzzy_results) == 1:
             t, n = fuzzy_results[0]
             market = cache['by_ticker'][t][1]
-            print(f"[SEARCH] matched={t}{_suffix(market)} name={n} (fuzzy)")
-            return t, n
+            ticker_out = f"{t}{_suffix(market)}"
+            print(f"[SEARCH]\nquery={query_raw}\nmatched={n}\nticker={ticker_out}")
+            return ticker_out, n
         return None, fuzzy_results
 
-    print(f"[SEARCH] no match: {query_raw}")
+    print(f"[SEARCH]\nquery={query_raw}\nmatched=None\nticker=None")
     return None, []
 
 
