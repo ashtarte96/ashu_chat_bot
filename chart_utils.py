@@ -1,7 +1,7 @@
 """
 chart_utils.py
 Binance REST API (primary) + Bybit v5 REST API (fallback)
-+ yfinance(미국주식) + pykrx(한국주식)
++ yfinance (US stocks) + pykrx (Korean stocks)
 """
 
 import logging
@@ -9,8 +9,8 @@ import tempfile
 import traceback as tb
 from datetime import date, datetime, timedelta
 
-import requests
 import pandas as pd
+import requests
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -19,33 +19,63 @@ import matplotlib.ticker as mticker
 
 logger = logging.getLogger(__name__)
 
-VALID_INTERVALS = {'1d', '1h', '4h', '15m', '5m'}
+# ── Timeframe constants ────────────────────────────────────────────────
+
+VALID_INTERVALS = {'1h', '4h', '12h', '1d', '1w', '1y'}
+
+_TIMEFRAME_LABEL = {
+    '1h': '1H', '4h': '4H', '12h': '12H',
+    '1d': '1D', '1w': '1W', '1y': '1Y',
+}
 
 _TIMEFRAME_DATE_FMT = {
-    '1d':  '%m/%d',
     '1h':  '%m/%d %H:%M',
     '4h':  '%m/%d %H:%M',
-    '15m': '%H:%M',
-    '5m':  '%H:%M',
+    '12h': '%m/%d %H:%M',
+    '1d':  '%m/%d',
+    '1w':  '%y/%m/%d',
+    '1y':  '%Y/%m',
 }
 
+# Binance kline interval strings (1y uses 1d data, resampled to monthly)
 _BINANCE_INTERVAL = {
-    '1d': '1d', '1h': '1h', '4h': '4h', '15m': '15m', '5m': '5m',
+    '1h': '1h', '4h': '4h', '12h': '12h',
+    '1d': '1d', '1w': '1w', '1y': '1d',
 }
 
+# Bybit kline interval strings (max 200 candles per request)
 _BYBIT_INTERVAL = {
-    '1d': 'D', '1h': '60', '4h': '240', '15m': '15', '5m': '5',
+    '1h': '60', '4h': '240', '12h': '720',
+    '1d': 'D', '1w': 'W', '1y': 'D',
 }
 
-_YF_US_PARAMS = {
-    '1d': ('1d', '1y'),
-    '1h': ('1h', '30d'),
+# API fetch limits
+# 1d fetches 365 so _draw_chart(tail 60) has data AND 52w stats are accurate
+_FETCH_LIMIT = {
+    '1h':  60,
+    '4h':  60,
+    '12h': 60,
+    '1d':  365,
+    '1w':  60,
+    '1y':  1000,  # daily data fetched, then resampled to monthly
 }
 
+# yfinance (interval, period) — 4h/12h fetched as 1h then resampled
+_YF_PARAMS = {
+    '1h':  ('1h',  '60d'),
+    '4h':  ('1h',  '60d'),
+    '12h': ('1h',  '60d'),
+    '1d':  ('1d',  '1y'),
+    '1w':  ('1wk', '5y'),
+    '1y':  ('1mo', '10y'),
+}
 
-# ═══════════════════════════════════════════════════
-# 포매터
-# ═══════════════════════════════════════════════════
+# Pandas month-end resample alias changed in 2.2
+_PD_VER = tuple(int(x) for x in pd.__version__.split('.')[:2])
+_MONTH_RULE = 'ME' if _PD_VER >= (2, 2) else 'M'
+
+
+# ── Formatters ─────────────────────────────────────────────────────────
 
 def normalize_symbol(ticker: str) -> str:
     ticker = ticker.upper().strip()
@@ -86,9 +116,7 @@ def _change_line(current: float, prev: float, fmt_fn=None) -> str:
     return f"-{abs_ch} (-{abs(pct):.2f}%)"
 
 
-# ═══════════════════════════════════════════════════
-# 심볼 변환
-# ═══════════════════════════════════════════════════
+# ── Symbol / timeframe parsing ─────────────────────────────────────────
 
 def _parse_symbol(user_input: str) -> str:
     """BTC / btc / BTC/USDT / BTCUSDT → 'BTCUSDT'"""
@@ -100,12 +128,31 @@ def _parse_symbol(user_input: str) -> str:
     return s + 'USDT'
 
 
-# ═══════════════════════════════════════════════════
-# Binance REST API
-# ═══════════════════════════════════════════════════
+def parse_timeframe(raw: str) -> 'str | None':
+    """'1H' / '4h' / '1W' → normalized lowercase key. None if invalid."""
+    normalized = raw.strip().lower()
+    return normalized if normalized in VALID_INTERVALS else None
 
-def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 500) -> 'pd.DataFrame | None':
-    """Binance spot kline. symbol='BTCUSDT'"""
+
+# ── OHLCV resampling ───────────────────────────────────────────────────
+
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample OHLCV DataFrame to a coarser frequency."""
+    agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
+    if 'volume' in df.columns:
+        agg['volume'] = 'sum'
+    return df.resample(rule).agg(agg).dropna(subset=['open', 'close'])
+
+
+def _to_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """Resample daily data to monthly, keep last 60 months."""
+    return _resample_ohlcv(df, _MONTH_RULE).tail(60)
+
+
+# ── Binance REST API ───────────────────────────────────────────────────
+
+def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """Binance spot kline. Returns ascending DataFrame or None."""
     interval = _BINANCE_INTERVAL.get(timeframe, '1d')
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -127,7 +174,7 @@ def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 500) -> 'pd.Dat
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
-        print(f"[BINANCE SPOT OK] {symbol} rows={len(df)}")
+        print(f"[BINANCE SPOT OK] {symbol} {timeframe} rows={len(df)}")
         return df if not df.empty else None
     except Exception:
         print(f"[BINANCE SPOT FAIL] {symbol} {timeframe}")
@@ -136,8 +183,8 @@ def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 500) -> 'pd.Dat
         return None
 
 
-def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 500) -> 'pd.DataFrame | None':
-    """Binance USDT-M futures kline. symbol='BTCUSDT'"""
+def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """Binance USDT-M futures kline."""
     interval = _BINANCE_INTERVAL.get(timeframe, '1d')
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -159,7 +206,7 @@ def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 500) -> 'pd.
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
-        print(f"[BINANCE FUTURES OK] {symbol} rows={len(df)}")
+        print(f"[BINANCE FUTURES OK] {symbol} {timeframe} rows={len(df)}")
         return df if not df.empty else None
     except Exception:
         print(f"[BINANCE FUTURES FAIL] {symbol} {timeframe}")
@@ -169,7 +216,7 @@ def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 500) -> 'pd.
 
 
 def get_funding_rate(symbol: str) -> 'float | None':
-    """Binance USDT-M 최신 펀딩비. 실패 시 None 반환."""
+    """Binance USDT-M latest funding rate. Returns None on failure."""
     try:
         r = requests.get(
             "https://fapi.binance.com/fapi/v1/fundingRate",
@@ -184,12 +231,11 @@ def get_funding_rate(symbol: str) -> 'float | None':
     return None
 
 
-# ═══════════════════════════════════════════════════
-# Bybit v5 REST API
-# ═══════════════════════════════════════════════════
+# ── Bybit v5 REST API ──────────────────────────────────────────────────
 
-def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataFrame | None':
-    """Bybit spot kline. symbol='BTCUSDT'"""
+def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """Bybit spot kline. Returns ascending DataFrame or None."""
+    limit    = min(limit, 200)  # Bybit max is 200
     interval = _BYBIT_INTERVAL.get(timeframe, 'D')
     params = {"category": "spot", "symbol": symbol,
               "interval": interval, "limit": limit}
@@ -207,7 +253,7 @@ def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataF
         if not rows:
             print(f"[BYBIT SPOT FAIL] {symbol} empty list")
             return None
-        rows = sorted(rows, key=lambda x: int(x[0]))  # 최신순 → 오름차순
+        rows = sorted(rows, key=lambda x: int(x[0]))  # newest-first → ascending
         df = pd.DataFrame(rows,
                           columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
         df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
@@ -215,7 +261,7 @@ def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataF
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
-        print(f"[BYBIT SPOT OK] {symbol} rows={len(df)}")
+        print(f"[BYBIT SPOT OK] {symbol} {timeframe} rows={len(df)}")
         return df if not df.empty else None
     except Exception:
         print(f"[BYBIT SPOT FAIL] {symbol} {timeframe}")
@@ -224,8 +270,9 @@ def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataF
         return None
 
 
-def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataFrame | None':
-    """Bybit USDT linear perps kline. symbol='BTCUSDT'"""
+def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """Bybit USDT linear perps kline."""
+    limit    = min(limit, 200)
     interval = _BYBIT_INTERVAL.get(timeframe, 'D')
     params = {"category": "linear", "symbol": symbol,
               "interval": interval, "limit": limit}
@@ -251,7 +298,7 @@ def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 200) -> 'pd.Data
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
-        print(f"[BYBIT PERPS OK] {symbol} rows={len(df)}")
+        print(f"[BYBIT PERPS OK] {symbol} {timeframe} rows={len(df)}")
         return df if not df.empty else None
     except Exception:
         print(f"[BYBIT PERPS FAIL] {symbol} {timeframe}")
@@ -260,12 +307,9 @@ def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 200) -> 'pd.Data
         return None
 
 
-# ═══════════════════════════════════════════════════
-# /au: 미국주식 (yfinance only)
-# ═══════════════════════════════════════════════════
+# ── US stocks (yfinance) ───────────────────────────────────────────────
 
 def _normalize_yf_df(data) -> 'pd.DataFrame | None':
-    """yfinance df → open/high/low/close 소문자, UTC tz."""
     if data is None or data.empty:
         return None
     if isinstance(data.columns, pd.MultiIndex):
@@ -276,33 +320,43 @@ def _normalize_yf_df(data) -> 'pd.DataFrame | None':
     req = ['open', 'high', 'low', 'close']
     if not all(c in data.columns for c in req):
         return None
-    data = data[req].dropna()
+    if 'volume' not in data.columns:
+        data = data[req].copy()
+        data['volume'] = 0.0
+    else:
+        data = data[req + ['volume']].copy()
+    data = data.dropna(subset=req)
     return data if not data.empty else None
 
 
 def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
-    """yfinance 미국주식 조회. 실패 시 ValueError."""
+    """Fetch yfinance data, resample if needed, return last 60 rows."""
     import yfinance as yf
-    interval, period = _YF_US_PARAMS.get(timeframe, ('1d', '1y'))
-    print("[AU TRY]", ticker)
+    yf_interval, yf_period = _YF_PARAMS.get(timeframe, ('1d', '1y'))
+    print(f"[AU TRY] {ticker} {timeframe} interval={yf_interval} period={yf_period}")
     try:
-        raw = yf.Ticker(ticker).history(period=period, interval=interval)
+        raw = yf.Ticker(ticker).history(period=yf_period, interval=yf_interval)
         df  = _normalize_yf_df(raw)
-        if df is not None:
-            print("[AU OK]", ticker)
-            return df
-        print("[AU FAIL]", "empty data")
-        raise ValueError(f"yfinance 빈 데이터: {ticker}")
+        if df is None:
+            raise ValueError(f"yfinance 빈 데이터: {ticker}")
+        # resample for 4h/12h (base data is 1h)
+        if timeframe == '4h':
+            df = _resample_ohlcv(df, '4h')
+        elif timeframe == '12h':
+            df = _resample_ohlcv(df, '12h')
+        df = df.tail(60)
+        if df.empty:
+            raise ValueError(f"yfinance 빈 데이터: {ticker}")
+        print(f"[AU OK] {ticker} {timeframe} rows={len(df)}")
+        return df
     except ValueError:
         raise
     except Exception as e:
-        print("[AU FAIL]", e)
+        print(f"[AU FAIL] {e}")
         raise ValueError(f"yfinance 조회 실패: {ticker}") from e
 
 
-# ═══════════════════════════════════════════════════
-# 한국 주식 (pykrx) — 변경 없음
-# ═══════════════════════════════════════════════════
+# ── Korean stocks (pykrx) ──────────────────────────────────────────────
 
 KR_STOCK_MAP = {
     "삼성전자":          ("005930", "삼성전자"),
@@ -342,7 +396,6 @@ def get_latest_krx_date() -> str:
         from pykrx import stock
     except ImportError:
         return datetime.now().strftime("%Y%m%d")
-
     today = datetime.now()
     for i in range(14):
         d = today - timedelta(days=i)
@@ -418,14 +471,30 @@ def find_kr_stock(query: str):
 
 
 def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
-    """KRX 차트. Returns (file_path, caption) or raises."""
+    """
+    KRX candlestick chart.
+    Supported: 1d / 1w / 1y  (pykrx has no intraday data)
+    Returns (file_path, caption) or raises.
+    """
+    if timeframe not in ('1d', '1w', '1y'):
+        raise ValueError(
+            f"한국 주식은 1d / 1w / 1y 인터벌만 지원합니다.\n"
+            f"입력값: {timeframe}"
+        )
     try:
         from pykrx import stock as krx
     except ImportError:
         raise ImportError("pykrx 패키지가 설치되지 않았습니다: pip install pykrx")
 
+    if timeframe == '1d':
+        days_back = 90      # ~60 trading days
+    elif timeframe == '1w':
+        days_back = 700     # ~100 weeks, take last 60
+    else:                   # 1y
+        days_back = 1825    # ~5 years daily, resample monthly → last 60
+
     todate   = date.today().strftime("%Y%m%d")
-    fromdate = (date.today() - timedelta(days=400)).strftime("%Y%m%d")
+    fromdate = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
 
     df = krx.get_market_ohlcv_by_date(fromdate, todate, ticker)
     if df is None or df.empty:
@@ -440,18 +509,27 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     if df.index.tz is None:
         df.index = pd.to_datetime(df.index).tz_localize('Asia/Seoul').tz_convert('UTC')
 
+    # Keep raw daily data for 52w stats before resampling
+    df_raw = df.copy()
+
+    if timeframe == '1w':
+        df = _resample_ohlcv(df, 'W').tail(60)
+    elif timeframe == '1y':
+        df = _to_monthly(df)
+
     current_price = float(df['close'].iloc[-1])
     prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
-    df_52w        = df.tail(252)
-    high_52w      = float(df_52w['high'].max())
-    low_52w       = float(df_52w['low'].min())
+    high_52w      = float(df_raw.tail(252)['high'].max())
+    low_52w       = float(df_raw.tail(252)['low'].min())
 
-    title    = f"{name} ({ticker}) - 1D - KRX"
+    label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+    title    = f"{name} ({ticker}) - {label} - KRX"
     tmp_path = _make_tmp_path()
     _draw_chart(df, title, timeframe, tmp_path)
 
     caption = (
-        f"📊 {name} ({ticker}) 차트 (1d)\n\n"
+        f"📊 {name} ({ticker}) 차트\n"
+        f"🕒 Timeframe: {label}\n\n"
         f"현재가: {_fmt_kr(current_price)} KRW\n"
         f"전일대비: {_change_line(current_price, prev_price, _fmt_kr)}\n"
         f"52주 최고가: {_fmt_kr(high_52w)} KRW\n"
@@ -460,9 +538,7 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     return tmp_path, caption
 
 
-# ═══════════════════════════════════════════════════
-# 차트 그리기
-# ═══════════════════════════════════════════════════
+# ── Chart drawing ──────────────────────────────────────────────────────
 
 def _make_tmp_path() -> str:
     tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
@@ -471,8 +547,8 @@ def _make_tmp_path() -> str:
 
 
 def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> None:
-    """단일 axes 캔들스틱 차트. 최근 80봉. 볼륨/MA/legend 없음."""
-    df = df.tail(80).copy()
+    """TradingView-dark candlestick chart. Shows last 60 candles."""
+    df = df.tail(60).copy()
     timestamps = df.index.tolist()
     df = df.reset_index(drop=True)
     n  = len(df)
@@ -597,9 +673,7 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
     plt.close(fig)
 
 
-# ═══════════════════════════════════════════════════
-# 공개 함수
-# ═══════════════════════════════════════════════════
+# ── Public chart functions ─────────────────────────────────────────────
 
 def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
     """/ac: Binance spot → Bybit spot fallback"""
@@ -610,12 +684,12 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        # 1. Binance spot
-        df     = fetch_binance_spot(sym, timeframe, 500)
+        limit = _FETCH_LIMIT.get(timeframe, 60)
+
+        df = fetch_binance_spot(sym, timeframe, limit)
         source = 'Binance spot'
-        # 2. Bybit spot fallback
         if df is None:
-            df     = fetch_bybit_spot(sym, timeframe, 200)
+            df     = fetch_bybit_spot(sym, timeframe, limit)
             source = 'Bybit spot'
 
         if df is None:
@@ -625,28 +699,44 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
             )
             return result
 
+        df_raw = df.copy()  # keep before resampling for 52w stats
+
+        if timeframe == '1y':
+            df = _to_monthly(df)
+
+        if df is None or df.empty:
+            result['error'] = f"데이터 리샘플링 실패: {sym}"
+            return result
+
         result['exchange'] = source
-        current_price      = float(df['close'].iloc[-1])
-        prev_price         = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        current_price = float(df['close'].iloc[-1])
+        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저
-        high_52w = low_52w = None
-        if timeframe == '1d':
-            high_52w = float(df['high'].max())
-            low_52w  = float(df['low'].min())
+        # 52-week high/low
+        if timeframe in ('1d', '1y'):
+            df_52w   = df_raw.tail(365)
+            high_52w = float(df_52w['high'].max())
+            low_52w  = float(df_52w['low'].min())
+        elif timeframe == '1w':
+            # 60 weeks > 52 weeks; use directly
+            high_52w = float(df_raw['high'].max())
+            low_52w  = float(df_raw['low'].min())
         else:
-            df_1d = fetch_binance_spot(sym, '1d', 365) or fetch_bybit_spot(sym, '1d', 365)
-            if df_1d is not None:
-                high_52w = float(df_1d['high'].max())
-                low_52w  = float(df_1d['low'].min())
+            # 1h / 4h / 12h: fetch a year of daily data for 52w stats
+            df_1d = (fetch_binance_spot(sym, '1d', 365) or
+                     fetch_bybit_spot(sym, '1d', 365))
+            high_52w = float(df_1d['high'].max()) if df_1d is not None else None
+            low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
-        title    = f"{sym} - {timeframe.upper()} - {source}"
+        label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+        title    = f"{sym} - {label} - {source}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {sym} 차트 ({timeframe})\n",
+            f"📊 {sym} 차트",
+            f"🕒 Timeframe: {label}\n",
             f"현재가: {format_price(current_price)} USDT",
             f"전일대비: {_change_line(current_price, prev_price)}",
         ]
@@ -676,12 +766,12 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        # 1. Binance futures
-        df     = fetch_binance_futures(sym, timeframe, 500)
+        limit = _FETCH_LIMIT.get(timeframe, 60)
+
+        df = fetch_binance_futures(sym, timeframe, limit)
         source = 'Binance futures'
-        # 2. Bybit perps fallback
         if df is None:
-            df     = fetch_bybit_perps(sym, timeframe, 200)
+            df     = fetch_bybit_perps(sym, timeframe, limit)
             source = 'Bybit perps'
 
         if df is None:
@@ -691,32 +781,43 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
             )
             return result
 
+        df_raw = df.copy()
+
+        if timeframe == '1y':
+            df = _to_monthly(df)
+
+        if df is None or df.empty:
+            result['error'] = f"데이터 리샘플링 실패: {sym}"
+            return result
+
         result['exchange'] = source
-        current_price      = float(df['close'].iloc[-1])
-        prev_price         = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        current_price = float(df['close'].iloc[-1])
+        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52주 고/저
-        high_52w = low_52w = None
-        if timeframe == '1d':
-            high_52w = float(df['high'].max())
-            low_52w  = float(df['low'].min())
+        if timeframe in ('1d', '1y'):
+            df_52w   = df_raw.tail(365)
+            high_52w = float(df_52w['high'].max())
+            low_52w  = float(df_52w['low'].min())
+        elif timeframe == '1w':
+            high_52w = float(df_raw['high'].max())
+            low_52w  = float(df_raw['low'].min())
         else:
             df_1d = (fetch_binance_futures(sym, '1d', 365) or
                      fetch_bybit_perps(sym, '1d', 365))
-            if df_1d is not None:
-                high_52w = float(df_1d['high'].max())
-                low_52w  = float(df_1d['low'].min())
+            high_52w = float(df_1d['high'].max()) if df_1d is not None else None
+            low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
-        # 펀딩비 (Binance, 선택)
         funding = get_funding_rate(sym)
 
-        title    = f"{sym} PERPS - {timeframe.upper()} - {source}"
+        label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+        title    = f"{sym} PERPS - {label} - {source}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {sym} 선물 차트 ({timeframe})\n",
+            f"📊 {sym} 선물 차트",
+            f"🕒 Timeframe: {label}\n",
             f"현재가: {format_price(current_price)} USDT",
             f"전일대비: {_change_line(current_price, prev_price)}",
         ]
@@ -740,7 +841,7 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
-    """/au: yfinance only"""
+    """/au: yfinance, all timeframes"""
     ticker = ticker.upper().strip()
     result = {
         'success': False, 'file_path': None, 'current_price': None,
@@ -748,8 +849,11 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         'error': None, 'currency': '$', 'caption': '',
     }
 
-    if timeframe not in ('1d', '1h'):
-        result['error'] = "미국 주식은 1d / 1h 인터벌만 지원합니다."
+    if timeframe not in VALID_INTERVALS:
+        result['error'] = (
+            f"지원하지 않는 인터벌: {timeframe}\n"
+            f"지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y"
+        )
         return result
 
     try:
@@ -759,6 +863,7 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
+        # 52w stats from 1d data
         high_52w = low_52w = None
         if timeframe == '1d':
             high_52w = float(df['high'].max())
@@ -771,12 +876,14 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
             except Exception:
                 pass
 
-        title    = f"{ticker} - {timeframe.upper()} - yfinance"
+        label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+        title    = f"{ticker} - {label} - yfinance"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
         lines = [
-            f"📊 {ticker} 차트 ({timeframe})\n",
+            f"📊 {ticker} 차트",
+            f"🕒 Timeframe: {label}\n",
             f"현재가: {_fmt_us(current_price)} USD",
             f"전일대비: {_change_line(current_price, prev_price, _fmt_us)}",
         ]
