@@ -4,9 +4,12 @@ Binance REST API (primary) + Bybit v5 REST API (fallback)
 + yfinance (US stocks) + pykrx (Korean stocks)
 """
 
+import difflib
 import logging
+import re
 import tempfile
 import traceback as tb
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -366,37 +369,88 @@ def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
 
 # ── Korean stocks (pykrx) ──────────────────────────────────────────────
 
+def _normalize_query(text: str) -> str:
+    """NFC-normalize, strip spaces/special chars, uppercase for Korean name matching."""
+    text = unicodedata.normalize('NFC', text)
+    text = re.sub(r'[\s\-\.\(\)·/]', '', text)
+    return text.upper()
+
+
 KR_STOCK_MAP = {
-    "삼성전자":          ("005930", "삼성전자"),
-    "삼전":              ("005930", "삼성전자"),
-    "SK하이닉스":        ("000660", "SK하이닉스"),
-    "하이닉스":          ("000660", "SK하이닉스"),
-    "현대차":            ("005380", "현대차"),
-    "현대자동차":        ("005380", "현대차"),
-    "기아":              ("000270", "기아"),
-    "NAVER":             ("035420", "NAVER"),
-    "네이버":            ("035420", "NAVER"),
-    "카카오":            ("035720", "카카오"),
-    "LG에너지솔루션":    ("373220", "LG에너지솔루션"),
-    "셀트리온":          ("068270", "셀트리온"),
-    "삼성바이오로직스":  ("207940", "삼성바이오로직스"),
-    "삼성SDI":           ("006400", "삼성SDI"),
-    "LG화학":            ("051910", "LG화학"),
-    "포스코":            ("005490", "POSCO홀딩스"),
-    "POSCO":             ("005490", "POSCO홀딩스"),
-    "KB금융":            ("105560", "KB금융"),
-    "신한지주":          ("055550", "신한지주"),
-    "하나금융지주":      ("086790", "하나금융지주"),
-    "카카오뱅크":        ("323410", "카카오뱅크"),
-    "미래에셋증권":      ("006800", "미래에셋증권"),
-    "미래에셋":          ("006800", "미래에셋증권"),
-    "키움증권":          ("039490", "키움증권"),
-    "키움":              ("039490", "키움증권"),
+    # ── KOSPI Blue chips ──────────────────────────────────────────────
+    "삼성전자":           ("005930", "삼성전자"),
+    "삼전":               ("005930", "삼성전자"),
+    "SK하이닉스":         ("000660", "SK하이닉스"),
+    "하이닉스":           ("000660", "SK하이닉스"),
+    "현대차":             ("005380", "현대차"),
+    "현대자동차":         ("005380", "현대차"),
+    "기아":               ("000270", "기아"),
+    "NAVER":              ("035420", "NAVER"),
+    "네이버":             ("035420", "NAVER"),
+    "카카오":             ("035720", "카카오"),
+    "LG에너지솔루션":     ("373220", "LG에너지솔루션"),
+    "셀트리온":           ("068270", "셀트리온"),
+    "삼성바이오로직스":   ("207940", "삼성바이오로직스"),
+    "삼바":               ("207940", "삼성바이오로직스"),
+    "삼성SDI":            ("006400", "삼성SDI"),
+    "LG화학":             ("051910", "LG화학"),
+    "포스코":             ("005490", "POSCO홀딩스"),
+    "POSCO":              ("005490", "POSCO홀딩스"),
+    "POSCO홀딩스":        ("005490", "POSCO홀딩스"),
+    "포스코홀딩스":       ("005490", "POSCO홀딩스"),
+    "KB금융":             ("105560", "KB금융"),
+    "신한지주":           ("055550", "신한지주"),
+    "하나금융지주":       ("086790", "하나금융지주"),
+    "카카오뱅크":         ("323410", "카카오뱅크"),
+    "미래에셋증권":       ("006800", "미래에셋증권"),
+    "미래에셋":           ("006800", "미래에셋증권"),
+    "키움증권":           ("039490", "키움증권"),
+    "키움":               ("039490", "키움증권"),
+    "삼성물산":           ("028260", "삼성물산"),
+    "현대모비스":         ("012330", "현대모비스"),
+    "LG전자":             ("066570", "LG전자"),
+    "삼성전기":           ("009150", "삼성전기"),
+    "고려아연":           ("010130", "고려아연"),
+    "삼성생명":           ("032830", "삼성생명"),
+    "삼성화재":           ("000810", "삼성화재"),
+    "한국전력":           ("015760", "한국전력"),
+    "한전":               ("015760", "한국전력"),
+    "LG이노텍":           ("011070", "LG이노텍"),
+    "한화에어로스페이스": ("012450", "한화에어로스페이스"),
+    "한화에어":           ("012450", "한화에어로스페이스"),
+    "롯데케미칼":         ("011170", "롯데케미칼"),
+    # ── User-reported missing stocks ──────────────────────────────────
+    "두산에너빌리티":     ("034020", "두산에너빌리티"),
+    "두산에너":           ("034020", "두산에너빌리티"),
+    "포스코퓨처엠":       ("003670", "POSCO퓨처엠"),
+    "POSCO퓨처엠":        ("003670", "POSCO퓨처엠"),
+    "포스코퓨처":         ("003670", "POSCO퓨처엠"),
+    "카카오페이":         ("377300", "카카오페이"),
+    # ── KOSDAQ growth stocks ──────────────────────────────────────────
+    "에코프로":           ("086520", "에코프로"),
+    "에코프로비엠":       ("247540", "에코프로비엠"),
+    "크래프톤":           ("259960", "크래프톤"),
+    "카카오게임즈":       ("293490", "카카오게임즈"),
+    "카카오게임":         ("293490", "카카오게임즈"),
+    "엔씨소프트":         ("036570", "엔씨소프트"),
+    "엔씨":               ("036570", "엔씨소프트"),
+    "두산밥캣":           ("241560", "두산밥캣"),
+    "하이브":             ("352820", "HYBE"),
+    "HYBE":               ("352820", "HYBE"),
+    # ── ETFs ──────────────────────────────────────────────────────────
+    "KODEX200":           ("069500", "KODEX 200"),
+    "KODEX 200":          ("069500", "KODEX 200"),
+    "TIGER미국S&P500":    ("360750", "TIGER 미국S&P500"),
+    "TIGER 미국S&P500":   ("360750", "TIGER 미국S&P500"),
 }
 
+# Pre-computed normalized lookup — avoids re-normalizing on every query
+_KR_MAP_NORMALIZED = {_normalize_query(k): v for k, v in KR_STOCK_MAP.items()}
 
-def normalize_kr_name(text: str) -> str:
-    return text.strip().replace(" ", "").upper()
+# Module-level KRX full-listing cache (rebuilt once per calendar day)
+# Each entry: (ticker, name, normalized_name, market)
+_krx_cache: list = []
+_krx_cache_date: str = ''
 
 
 def get_latest_krx_date() -> str:
@@ -417,17 +471,70 @@ def get_latest_krx_date() -> str:
     return datetime.now().strftime("%Y%m%d")
 
 
+def _build_krx_cache(date_str: str) -> list:
+    """Fetch full KOSPI/KOSDAQ/KONEX listing from pykrx and return cached list."""
+    try:
+        from pykrx import stock
+    except ImportError:
+        logger.error("[KRX CACHE] pykrx not installed")
+        return []
+    result = []
+    for market in ('KOSPI', 'KOSDAQ', 'KONEX'):
+        try:
+            tickers = stock.get_market_ticker_list(date=date_str, market=market)
+            logger.info("[KRX CACHE BUILD] %s: %d tickers", market, len(tickers))
+            for ticker in tickers:
+                try:
+                    name = stock.get_market_ticker_name(ticker)
+                    if name:
+                        result.append((ticker, name, _normalize_query(name), market))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("[KRX CACHE BUILD ERROR] %s: %s", market, e)
+    print(f"[KRX CACHE] built {len(result)} stocks for {date_str}")
+    return result
+
+
+def _get_krx_cache() -> list:
+    """Return cached KRX stock list, rebuilding if it's stale (daily)."""
+    global _krx_cache, _krx_cache_date
+    today = date.today().strftime('%Y%m%d')
+    if _krx_cache and _krx_cache_date == today:
+        return _krx_cache
+    print(f"[KRX CACHE] building for {today} ...")
+    date_str = get_latest_krx_date()
+    _krx_cache = _build_krx_cache(date_str)
+    _krx_cache_date = today
+    return _krx_cache
+
+
 def find_kr_stock(query: str):
+    """
+    Search for a Korean stock by name or 6-digit code.
+    Returns (ticker, name) for a unique match.
+    Returns (None, [(ticker, name), ...]) for multiple candidates.
+    Returns (None, []) when nothing is found.
+
+    Search priority:
+      1. Static map exact match (instant, covers ~70 popular stocks + aliases)
+      2. 6-digit numeric code direct lookup
+      3. KRX full-listing cache — exact normalized match
+      4. KRX full-listing cache — substring match
+      5. difflib fuzzy match (cutoff=0.6)
+    """
     query_raw  = query.strip()
-    query_norm = query_raw.replace(" ", "").upper()
+    query_norm = _normalize_query(query_raw)
 
     print("[KRX SEARCH] raw=%s norm=%s" % (query_raw, query_norm))
 
-    if query_norm in KR_STOCK_MAP:
-        ticker, name = KR_STOCK_MAP[query_norm]
+    # 1. Static map
+    if query_norm in _KR_MAP_NORMALIZED:
+        ticker, name = _KR_MAP_NORMALIZED[query_norm]
         print("[KRX MAP FOUND]", ticker, name)
         return ticker, name
 
+    # 2. 6-digit code
     if query_raw.isdigit() and len(query_raw) == 6:
         try:
             from pykrx import stock
@@ -439,42 +546,48 @@ def find_kr_stock(query: str):
             logger.warning("[KRX CODE ERROR] %s %s", query_raw, e)
         return None, []
 
-    try:
-        from pykrx import stock
-    except ImportError:
-        logger.error("pykrx 미설치")
+    # 3 & 4 & 5. Full KRX cache search
+    cache = _get_krx_cache()
+    if not cache:
+        logger.warning("[KRX] cache empty — no results for: %s", query_raw)
         return None, []
 
-    query_norm_upper = normalize_kr_name(query_raw)
-    date_str = get_latest_krx_date()
-    logger.info("[KRX DATE USED] %s", date_str)
+    exact_matches    = []
+    contains_matches = []
+    all_norm_names   = []
 
-    exact_matches   = []
-    partial_matches = []
-
-    for market in ("KOSPI", "KOSDAQ", "KONEX"):
-        try:
-            tickers = stock.get_market_ticker_list(date=date_str, market=market)
-            logger.info("[KRX MARKET] %s count=%d", market, len(tickers))
-            for ticker in tickers:
-                name      = stock.get_market_ticker_name(ticker)
-                name_norm = normalize_kr_name(name)
-                if name_norm == query_norm_upper:
-                    exact_matches.append((ticker, name))
-                elif query_norm_upper in name_norm or name_norm in query_norm_upper:
-                    partial_matches.append((ticker, name))
-        except Exception as e:
-            logger.warning("[KRX MARKET ERROR] %s %s", market, e)
+    for ticker, name, name_norm, market in cache:
+        all_norm_names.append(name_norm)
+        if name_norm == query_norm:
+            exact_matches.append((ticker, name))
+        elif query_norm in name_norm or name_norm in query_norm:
+            contains_matches.append((ticker, name))
 
     if exact_matches:
-        logger.info("[KRX EXACT] %s", exact_matches[0])
+        print("[KRX CACHE EXACT]", exact_matches[0])
         return exact_matches[0][0], exact_matches[0][1]
 
-    if partial_matches:
-        logger.info("[KRX PARTIAL] %s", partial_matches[:5])
-        return None, partial_matches[:5]
+    if contains_matches:
+        print("[KRX CACHE CONTAINS]", contains_matches[:5])
+        return None, contains_matches[:5]
 
-    logger.info("[KRX NO MATCH] %s", query_raw)
+    # 5. Fuzzy match
+    fuzzy_norms = difflib.get_close_matches(query_norm, all_norm_names, n=5, cutoff=0.6)
+    if fuzzy_norms:
+        fuzzy_set = set(fuzzy_norms)
+        seen = set()
+        fuzzy_results = []
+        for ticker, name, nn, market in cache:
+            if nn in fuzzy_set and ticker not in seen:
+                fuzzy_results.append((ticker, name))
+                seen.add(ticker)
+        fuzzy_results = fuzzy_results[:5]
+        print("[KRX FUZZY]", fuzzy_results)
+        if len(fuzzy_results) == 1:
+            return fuzzy_results[0][0], fuzzy_results[0][1]
+        return None, fuzzy_results
+
+    print("[KRX NO MATCH]", query_raw)
     return None, []
 
 
