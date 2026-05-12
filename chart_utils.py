@@ -1,11 +1,12 @@
 """
 chart_utils.py
-CoinMarketCap(코인 시세) + Bybit/Binance(선물) + yfinance(미국주식) + pykrx(한국주식)
+Binance REST API (primary) + Bybit v5 REST API (fallback)
++ yfinance(미국주식) + pykrx(한국주식)
 """
 
 import logging
-import os
 import tempfile
+import traceback as tb
 from datetime import date, datetime, timedelta
 
 import requests
@@ -28,15 +29,14 @@ _TIMEFRAME_DATE_FMT = {
     '5m':  '%H:%M',
 }
 
-_BYBIT_INTERVAL = {
-    '1d': 'D', '1h': '60', '4h': '240', '15m': '15', '5m': '5',
-}
-
 _BINANCE_INTERVAL = {
     '1d': '1d', '1h': '1h', '4h': '4h', '15m': '15m', '5m': '5m',
 }
 
-# yfinance 미국주식 전용
+_BYBIT_INTERVAL = {
+    '1d': 'D', '1h': '60', '4h': '240', '15m': '15', '5m': '5',
+}
+
 _YF_US_PARAMS = {
     '1d': ('1d', '1y'),
     '1h': ('1h', '30d'),
@@ -87,89 +87,10 @@ def _change_line(current: float, prev: float, fmt_fn=None) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# CoinMarketCap API (/ac 코인 현재가)
-# ═══════════════════════════════════════════════════
-
-_CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-
-
-def _to_cmc_symbol(user_input: str) -> str:
-    """BTC / btc / BTC/USDT / BTCUSDT → 'BTC'"""
-    s = user_input.upper().strip()
-    if '/' in s:
-        s = s.split('/')[0]
-    if s.endswith('USDT'):
-        s = s[:-4]
-    return s
-
-
-def _fmt_large(value: float) -> str:
-    """시가총액/거래량 축약 포맷 ($1.57T, $28.3B ...)"""
-    if value >= 1e12:
-        return f"${value / 1e12:.2f}T"
-    if value >= 1e9:
-        return f"${value / 1e9:.2f}B"
-    if value >= 1e6:
-        return f"${value / 1e6:.2f}M"
-    return f"${value:,.2f}"
-
-
-def get_crypto_data(symbol: str) -> dict | None:
-    """
-    CoinMarketCap quotes/latest 호출.
-    환경변수 CMC_API_KEY 필요.
-    Returns dict or None.
-    """
-    api_key = os.getenv("CMC_API_KEY")
-    if not api_key:
-        print("[CMC FAIL] CMC_API_KEY not set")
-        return None
-
-    sym = _to_cmc_symbol(symbol)
-    headers = {
-        "Accepts": "application/json",
-        "X-CMC_PRO_API_KEY": api_key,
-    }
-    params = {"symbol": sym, "convert": "USD"}
-
-    print("[CMC TRY]", sym)
-    try:
-        r = requests.get(_CMC_URL, headers=headers, params=params, timeout=10)
-        data = r.json()
-
-        if "data" not in data or sym not in data["data"]:
-            err = data.get("status", {}).get("error_message", "unknown")
-            print("[CMC FAIL]", sym, err)
-            return None
-
-        coin  = data["data"][sym]
-        quote = coin["quote"]["USD"]
-
-        result = {
-            "name":       coin["name"],
-            "symbol":     coin["symbol"],
-            "rank":       coin.get("cmc_rank"),
-            "price":      quote["price"],
-            "change_1h":  quote.get("percent_change_1h", 0.0),
-            "change_24h": quote["percent_change_24h"],
-            "change_7d":  quote.get("percent_change_7d", 0.0),
-            "market_cap": quote.get("market_cap", 0.0),
-            "volume_24h": quote.get("volume_24h", 0.0),
-        }
-        print("[CMC OK]", sym, f"price={result['price']:.4f}")
-        return result
-
-    except Exception as e:
-        print("[CMC FAIL]", sym, e)
-        logger.warning("[CMC FAIL] %s: %s", sym, e)
-        return None
-
-
-# ═══════════════════════════════════════════════════
 # 심볼 변환
 # ═══════════════════════════════════════════════════
 
-def _to_usdt_symbol(user_input: str) -> str:
+def _parse_symbol(user_input: str) -> str:
     """BTC / btc / BTC/USDT / BTCUSDT → 'BTCUSDT'"""
     s = user_input.upper().strip()
     if '/' in s:
@@ -180,102 +101,163 @@ def _to_usdt_symbol(user_input: str) -> str:
 
 
 # ═══════════════════════════════════════════════════
-# Bybit v5 kline
+# Binance REST API
 # ═══════════════════════════════════════════════════
 
-def _bybit_kline(category: str, symbol: str, timeframe: str, limit: int = 365):
-    """
-    Bybit v5 /market/kline.
-    category: 'spot' | 'linear'
-    Returns DataFrame(open/high/low/close, DatetimeIndex UTC) or None.
-    """
-    interval = _BYBIT_INTERVAL.get(timeframe, 'D')
-    params = {
-        "category": category, "symbol": symbol,
-        "interval": interval, "limit":  limit,
-    }
-    try:
-        r = requests.get("https://api.bybit.com/v5/market/kline", params=params, timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if data.get('retCode') != 0:
-            return None
-        rows = data.get('result', {}).get('list', [])
-        if not rows:
-            return None
-        rows = sorted(rows, key=lambda x: int(x[0]))  # 최신순 → 오름차순
-        df = pd.DataFrame(rows, columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
-        df.index.name = 'timestamp'
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df[['open', 'high', 'low', 'close']].dropna()
-        return df if not df.empty else None
-    except Exception:
-        return None
-
-
-# ═══════════════════════════════════════════════════
-# Binance kline
-# ═══════════════════════════════════════════════════
-
-def _binance_kline(market: str, symbol: str, timeframe: str, limit: int = 365):
-    """
-    Binance kline.
-    market: 'spot' → api.binance.com | 'futures' → fapi.binance.com
-    Returns DataFrame or None.
-    """
+def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 500) -> 'pd.DataFrame | None':
+    """Binance spot kline. symbol='BTCUSDT'"""
     interval = _BINANCE_INTERVAL.get(timeframe, '1d')
-    url = (
-        "https://api.binance.com/api/v3/klines" if market == 'spot'
-        else "https://fapi.binance.com/fapi/v1/klines"
-    )
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get("https://api.binance.com/api/v3/klines",
+                         params=params, timeout=15)
         if r.status_code != 200:
+            print(f"[BINANCE SPOT FAIL] {symbol} HTTP {r.status_code}: {r.text[:200]}")
             return None
         rows = r.json()
         if not rows or not isinstance(rows, list):
+            print(f"[BINANCE SPOT FAIL] {symbol} empty response")
             return None
-        # Binance는 이미 오름차순
         df = pd.DataFrame(
-            [[row[0], row[1], row[2], row[3], row[4]] for row in rows],
-            columns=['ts', 'open', 'high', 'low', 'close'],
+            [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in rows],
+            columns=['ts', 'open', 'high', 'low', 'close', 'volume'],
         )
         df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
         df.index.name = 'timestamp'
-        for col in ['open', 'high', 'low', 'close']:
+        for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df[['open', 'high', 'low', 'close']].dropna()
+        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+        print(f"[BINANCE SPOT OK] {symbol} rows={len(df)}")
         return df if not df.empty else None
     except Exception:
+        print(f"[BINANCE SPOT FAIL] {symbol} {timeframe}")
+        print(tb.format_exc())
+        logger.error("[BINANCE SPOT FAIL] %s\n%s", symbol, tb.format_exc())
         return None
 
 
+def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 500) -> 'pd.DataFrame | None':
+    """Binance USDT-M futures kline. symbol='BTCUSDT'"""
+    interval = _BINANCE_INTERVAL.get(timeframe, '1d')
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/klines",
+                         params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"[BINANCE FUTURES FAIL] {symbol} HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        rows = r.json()
+        if not rows or not isinstance(rows, list):
+            print(f"[BINANCE FUTURES FAIL] {symbol} empty response")
+            return None
+        df = pd.DataFrame(
+            [[row[0], row[1], row[2], row[3], row[4], row[5]] for row in rows],
+            columns=['ts', 'open', 'high', 'low', 'close', 'volume'],
+        )
+        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
+        df.index.name = 'timestamp'
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+        print(f"[BINANCE FUTURES OK] {symbol} rows={len(df)}")
+        return df if not df.empty else None
+    except Exception:
+        print(f"[BINANCE FUTURES FAIL] {symbol} {timeframe}")
+        print(tb.format_exc())
+        logger.error("[BINANCE FUTURES FAIL] %s\n%s", symbol, tb.format_exc())
+        return None
+
+
+def get_funding_rate(symbol: str) -> 'float | None':
+    """Binance USDT-M 최신 펀딩비. 실패 시 None 반환."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/fundingRate",
+            params={"symbol": symbol, "limit": 1},
+            timeout=10,
+        )
+        data = r.json()
+        if data and isinstance(data, list):
+            return float(data[-1]['fundingRate'])
+    except Exception:
+        pass
+    return None
+
+
 # ═══════════════════════════════════════════════════
-# /ap: 코인 선물 조회 (Bybit perps → Binance futures)
+# Bybit v5 REST API
 # ═══════════════════════════════════════════════════
 
-def _fetch_perps_ap(symbol: str, timeframe: str, limit: int = 365):
-    """Returns (df, source_name) or (None, None)."""
-    sym = _to_usdt_symbol(symbol)
-    sources = [
-        ("Bybit perps",     lambda: _bybit_kline('linear',  sym, timeframe, limit)),
-        ("Binance futures", lambda: _binance_kline('futures', sym, timeframe, limit)),
-    ]
-    for name, fn in sources:
-        print("[AP TRY]", name, sym)
-        try:
-            df = fn()
-            if df is not None:
-                print("[AP OK]", name)
-                return df, name
-            print("[AP FAIL]", name, "no data")
-        except Exception as e:
-            print("[AP FAIL]", name, e)
-    return None, None
+def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataFrame | None':
+    """Bybit spot kline. symbol='BTCUSDT'"""
+    interval = _BYBIT_INTERVAL.get(timeframe, 'D')
+    params = {"category": "spot", "symbol": symbol,
+              "interval": interval, "limit": limit}
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/kline",
+                         params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"[BYBIT SPOT FAIL] {symbol} HTTP {r.status_code}")
+            return None
+        data = r.json()
+        if data.get('retCode') != 0:
+            print(f"[BYBIT SPOT FAIL] {symbol} retCode={data.get('retCode')} {data.get('retMsg')}")
+            return None
+        rows = data.get('result', {}).get('list', [])
+        if not rows:
+            print(f"[BYBIT SPOT FAIL] {symbol} empty list")
+            return None
+        rows = sorted(rows, key=lambda x: int(x[0]))  # 최신순 → 오름차순
+        df = pd.DataFrame(rows,
+                          columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
+        df.index.name = 'timestamp'
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+        print(f"[BYBIT SPOT OK] {symbol} rows={len(df)}")
+        return df if not df.empty else None
+    except Exception:
+        print(f"[BYBIT SPOT FAIL] {symbol} {timeframe}")
+        print(tb.format_exc())
+        logger.error("[BYBIT SPOT FAIL] %s\n%s", symbol, tb.format_exc())
+        return None
+
+
+def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataFrame | None':
+    """Bybit USDT linear perps kline. symbol='BTCUSDT'"""
+    interval = _BYBIT_INTERVAL.get(timeframe, 'D')
+    params = {"category": "linear", "symbol": symbol,
+              "interval": interval, "limit": limit}
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/kline",
+                         params=params, timeout=15)
+        if r.status_code != 200:
+            print(f"[BYBIT PERPS FAIL] {symbol} HTTP {r.status_code}")
+            return None
+        data = r.json()
+        if data.get('retCode') != 0:
+            print(f"[BYBIT PERPS FAIL] {symbol} retCode={data.get('retCode')} {data.get('retMsg')}")
+            return None
+        rows = data.get('result', {}).get('list', [])
+        if not rows:
+            print(f"[BYBIT PERPS FAIL] {symbol} empty list")
+            return None
+        rows = sorted(rows, key=lambda x: int(x[0]))
+        df = pd.DataFrame(rows,
+                          columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
+        df.index.name = 'timestamp'
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+        print(f"[BYBIT PERPS OK] {symbol} rows={len(df)}")
+        return df if not df.empty else None
+    except Exception:
+        print(f"[BYBIT PERPS FAIL] {symbol} {timeframe}")
+        print(tb.format_exc())
+        logger.error("[BYBIT PERPS FAIL] %s\n%s", symbol, tb.format_exc())
+        return None
 
 
 # ═══════════════════════════════════════════════════
@@ -436,10 +418,7 @@ def find_kr_stock(query: str):
 
 
 def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
-    """
-    KRX 티커와 종목명을 직접 받아 차트를 생성한다.
-    Returns (file_path, caption) or raises Exception.
-    """
+    """KRX 차트. Returns (file_path, caption) or raises."""
     try:
         from pykrx import stock as krx
     except ImportError:
@@ -463,10 +442,9 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
 
     current_price = float(df['close'].iloc[-1])
     prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
-
-    df_52w   = df.tail(252)
-    high_52w = float(df_52w['high'].max())
-    low_52w  = float(df_52w['low'].min())
+    df_52w        = df.tail(252)
+    high_52w      = float(df_52w['high'].max())
+    low_52w       = float(df_52w['low'].min())
 
     title    = f"{name} ({ticker}) - 1D - KRX"
     tmp_path = _make_tmp_path()
@@ -483,7 +461,7 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
 
 
 # ═══════════════════════════════════════════════════
-# 차트 그리기 — 변경 없음
+# 차트 그리기
 # ═══════════════════════════════════════════════════
 
 def _make_tmp_path() -> str:
@@ -493,7 +471,7 @@ def _make_tmp_path() -> str:
 
 
 def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> None:
-    """단일 axes 캔들스틱 차트. 1400×900 px. 볼륨/MA/legend 없음."""
+    """단일 axes 캔들스틱 차트. 최근 80봉. 볼륨/MA/legend 없음."""
     df = df.tail(80).copy()
     timestamps = df.index.tolist()
     df = df.reset_index(drop=True)
@@ -525,9 +503,9 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
             linewidth=0, facecolor=color, zorder=2,
         ))
 
-    price_low   = df['low'].min()
-    price_high  = df['high'].max()
-    price_range = max(price_high - price_low, price_high * 1e-6)
+    price_low    = df['low'].min()
+    price_high   = df['high'].max()
+    price_range  = max(price_high - price_low, price_high * 1e-6)
     arrow_offset = price_range * 0.08
 
     high_idx = int(df['high'].idxmax())
@@ -605,14 +583,12 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
         bbox=dict(boxstyle='round,pad=0.25', facecolor='#1c2333', edgecolor='none'),
         clip_on=False,
     )
-
     ax.text(
         0.01, 0.97, title,
         transform=ax.transAxes, va='top', ha='left',
         fontsize=24, color='white', fontweight='bold', zorder=7,
         bbox=dict(facecolor='#111722', alpha=0.85, edgecolor='none', pad=5),
     )
-
     for spine in ax.spines.values():
         spine.set_edgecolor(GRID_COLOR)
 
@@ -625,41 +601,47 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
 # 공개 함수
 # ═══════════════════════════════════════════════════
 
-def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """/ap: Bybit perps → Binance futures"""
-    sym       = _to_usdt_symbol(symbol)
-    base_name = sym.replace('USDT', '')
-
+def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
+    """/ac: Binance spot → Bybit spot fallback"""
+    sym = _parse_symbol(symbol)
     result = {
         'success': False, 'file_path': None, 'current_price': None,
-        'symbol': symbol, 'timeframe': timeframe, 'exchange': None,
+        'symbol': sym, 'timeframe': timeframe, 'exchange': None,
         'error': None, 'currency': '$', 'caption': '',
     }
     try:
-        df, exchange_name = _fetch_perps_ap(symbol, timeframe, 365)
+        # 1. Binance spot
+        df     = fetch_binance_spot(sym, timeframe, 500)
+        source = 'Binance spot'
+        # 2. Bybit spot fallback
+        if df is None:
+            df     = fetch_bybit_spot(sym, timeframe, 200)
+            source = 'Bybit spot'
+
         if df is None:
             result['error'] = (
-                f"해당 선물 데이터를 가져올 수 없습니다: {base_name}\n"
-                f"시도: Bybit perps, Binance futures"
+                f"코인 데이터를 가져올 수 없습니다: {sym}\n"
+                "Binance / Bybit 모두 실패 — 서버 로그를 확인하세요."
             )
             return result
 
-        result['exchange'] = exchange_name
-        current_price = float(df['close'].iloc[-1])
-        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        result['exchange'] = source
+        current_price      = float(df['close'].iloc[-1])
+        prev_price         = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
+        # 52주 고/저
         high_52w = low_52w = None
         if timeframe == '1d':
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
-            df_1d, _ = _fetch_perps_ap(symbol, '1d', 365)
+            df_1d = fetch_binance_spot(sym, '1d', 365) or fetch_bybit_spot(sym, '1d', 365)
             if df_1d is not None:
                 high_52w = float(df_1d['high'].max())
                 low_52w  = float(df_1d['low'].min())
 
-        title    = f"{sym} - {timeframe.upper()} - {exchange_name}"
+        title    = f"{sym} - {timeframe.upper()} - {source}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
@@ -677,9 +659,81 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
         result['file_path'] = tmp_path
         result['caption']   = '\n'.join(lines)
 
-    except Exception as e:
-        logger.error("create_perps_chart 오류: %s", e)
-        result['error'] = str(e)
+    except Exception:
+        logger.error("create_clean_candlestick_chart 오류:\n%s", tb.format_exc())
+        result['error'] = "차트 생성 중 오류가 발생했습니다. 서버 로그를 확인하세요."
+        plt.close('all')
+
+    return result
+
+
+def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
+    """/ap: Binance futures → Bybit perps fallback"""
+    sym = _parse_symbol(symbol)
+    result = {
+        'success': False, 'file_path': None, 'current_price': None,
+        'symbol': sym, 'timeframe': timeframe, 'exchange': None,
+        'error': None, 'currency': '$', 'caption': '',
+    }
+    try:
+        # 1. Binance futures
+        df     = fetch_binance_futures(sym, timeframe, 500)
+        source = 'Binance futures'
+        # 2. Bybit perps fallback
+        if df is None:
+            df     = fetch_bybit_perps(sym, timeframe, 200)
+            source = 'Bybit perps'
+
+        if df is None:
+            result['error'] = (
+                f"선물 데이터를 가져올 수 없습니다: {sym}\n"
+                "Binance futures / Bybit perps 모두 실패 — 서버 로그를 확인하세요."
+            )
+            return result
+
+        result['exchange'] = source
+        current_price      = float(df['close'].iloc[-1])
+        prev_price         = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        result['current_price'] = current_price
+
+        # 52주 고/저
+        high_52w = low_52w = None
+        if timeframe == '1d':
+            high_52w = float(df['high'].max())
+            low_52w  = float(df['low'].min())
+        else:
+            df_1d = (fetch_binance_futures(sym, '1d', 365) or
+                     fetch_bybit_perps(sym, '1d', 365))
+            if df_1d is not None:
+                high_52w = float(df_1d['high'].max())
+                low_52w  = float(df_1d['low'].min())
+
+        # 펀딩비 (Binance, 선택)
+        funding = get_funding_rate(sym)
+
+        title    = f"{sym} PERPS - {timeframe.upper()} - {source}"
+        tmp_path = _make_tmp_path()
+        _draw_chart(df, title, timeframe, tmp_path)
+
+        lines = [
+            f"📊 {sym} 선물 차트 ({timeframe})\n",
+            f"현재가: {format_price(current_price)} USDT",
+            f"전일대비: {_change_line(current_price, prev_price)}",
+        ]
+        if high_52w is not None:
+            lines.append(f"52주 최고가: {format_price(high_52w)} USDT")
+        if low_52w is not None:
+            lines.append(f"52주 최저가: {format_price(low_52w)} USDT")
+        if funding is not None:
+            lines.append(f"펀딩비: {funding * 100:.4f}%")
+
+        result['success']   = True
+        result['file_path'] = tmp_path
+        result['caption']   = '\n'.join(lines)
+
+    except Exception:
+        logger.error("create_perps_chart 오류:\n%s", tb.format_exc())
+        result['error'] = "선물 차트 생성 중 오류가 발생했습니다. 서버 로그를 확인하세요."
         plt.close('all')
 
     return result
@@ -735,9 +789,9 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         result['file_path'] = tmp_path
         result['caption']   = '\n'.join(lines)
 
-    except Exception as e:
-        logger.error("create_us_stock_chart 오류: %s", e)
-        result['error'] = str(e)
+    except Exception:
+        logger.error("create_us_stock_chart 오류:\n%s", tb.format_exc())
+        result['error'] = str(tb.format_exc().strip().split('\n')[-1])
         plt.close('all')
 
     return result
