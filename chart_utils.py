@@ -742,8 +742,9 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
             high_52w = float(df_raw['high'].max())
             low_52w  = float(df_raw['low'].min())
         else:
-            df_1d = (fetch_binance_spot(sym, '1d', 365) or
-                     fetch_bybit_spot(sym, '1d', 365))
+            df_1d = fetch_binance_spot(sym, '1d', 365)
+            if df_1d is None:
+                df_1d = fetch_bybit_spot(sym, '1d', 365)
             high_52w = float(df_1d['high'].max()) if df_1d is not None else None
             low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
@@ -824,8 +825,9 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
             high_52w = float(df_raw['high'].max())
             low_52w  = float(df_raw['low'].min())
         else:
-            df_1d = (fetch_binance_futures(sym, '1d', 365) or
-                     fetch_bybit_perps(sym, '1d', 365))
+            df_1d = fetch_binance_futures(sym, '1d', 365)
+            if df_1d is None:
+                df_1d = fetch_bybit_perps(sym, '1d', 365)
             high_52w = float(df_1d['high'].max()) if df_1d is not None else None
             low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
