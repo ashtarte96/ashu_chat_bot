@@ -175,11 +175,13 @@ def fetch_binance_spot(symbol: str, timeframe: str, limit: int = 60) -> 'pd.Data
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         print(f"[BINANCE SPOT OK] {symbol} {timeframe} rows={len(df)}")
+        print(f"[BINANCE SPOT DF] index.dtype={df.index.dtype} tz={df.index.tz}")
+        print(df.head(3).to_string())
         return df if not df.empty else None
     except Exception:
         print(f"[BINANCE SPOT FAIL] {symbol} {timeframe}")
-        print(tb.format_exc())
-        logger.error("[BINANCE SPOT FAIL] %s\n%s", symbol, tb.format_exc())
+        tb.print_exc()
+        logger.exception("[BINANCE SPOT FAIL] %s %s", symbol, timeframe)
         return None
 
 
@@ -207,11 +209,13 @@ def fetch_binance_futures(symbol: str, timeframe: str, limit: int = 60) -> 'pd.D
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         print(f"[BINANCE FUTURES OK] {symbol} {timeframe} rows={len(df)}")
+        print(f"[BINANCE FUTURES DF] index.dtype={df.index.dtype} tz={df.index.tz}")
+        print(df.head(3).to_string())
         return df if not df.empty else None
     except Exception:
         print(f"[BINANCE FUTURES FAIL] {symbol} {timeframe}")
-        print(tb.format_exc())
-        logger.error("[BINANCE FUTURES FAIL] %s\n%s", symbol, tb.format_exc())
+        tb.print_exc()
+        logger.exception("[BINANCE FUTURES FAIL] %s %s", symbol, timeframe)
         return None
 
 
@@ -262,11 +266,13 @@ def fetch_bybit_spot(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFr
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         print(f"[BYBIT SPOT OK] {symbol} {timeframe} rows={len(df)}")
+        print(f"[BYBIT SPOT DF] index.dtype={df.index.dtype} tz={df.index.tz}")
+        print(df.head(3).to_string())
         return df if not df.empty else None
     except Exception:
         print(f"[BYBIT SPOT FAIL] {symbol} {timeframe}")
-        print(tb.format_exc())
-        logger.error("[BYBIT SPOT FAIL] %s\n%s", symbol, tb.format_exc())
+        tb.print_exc()
+        logger.exception("[BYBIT SPOT FAIL] %s %s", symbol, timeframe)
         return None
 
 
@@ -299,11 +305,13 @@ def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataF
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
         print(f"[BYBIT PERPS OK] {symbol} {timeframe} rows={len(df)}")
+        print(f"[BYBIT PERPS DF] index.dtype={df.index.dtype} tz={df.index.tz}")
+        print(df.head(3).to_string())
         return df if not df.empty else None
     except Exception:
         print(f"[BYBIT PERPS FAIL] {symbol} {timeframe}")
-        print(tb.format_exc())
-        logger.error("[BYBIT PERPS FAIL] %s\n%s", symbol, tb.format_exc())
+        tb.print_exc()
+        logger.exception("[BYBIT PERPS FAIL] %s %s", symbol, timeframe)
         return None
 
 
@@ -548,6 +556,9 @@ def _make_tmp_path() -> str:
 
 def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> None:
     """TradingView-dark candlestick chart. Shows last 60 candles."""
+    print(f"[DRAW] enter title='{title}' timeframe={timeframe}")
+    print(f"[DRAW] input shape={df.shape} index.dtype={df.index.dtype} tz={df.index.tz}")
+    print(f"[DRAW] df.head:\n{df.head(3).to_string()}")
     df = df.tail(60).copy()
     timestamps = df.index.tolist()
     df = df.reset_index(drop=True)
@@ -685,24 +696,33 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
     }
     try:
         limit = _FETCH_LIMIT.get(timeframe, 60)
+        print(f"[AC] sym={sym} timeframe={timeframe} limit={limit}")
 
         df = fetch_binance_spot(sym, timeframe, limit)
         source = 'Binance spot'
         if df is None:
+            print(f"[AC] Binance spot None → try Bybit spot")
             df     = fetch_bybit_spot(sym, timeframe, limit)
             source = 'Bybit spot'
 
         if df is None:
+            print(f"[AC] Both sources returned None for {sym} {timeframe}")
             result['error'] = (
                 f"코인 데이터를 가져올 수 없습니다: {sym}\n"
                 "Binance / Bybit 모두 실패 — 서버 로그를 확인하세요."
             )
             return result
 
-        df_raw = df.copy()  # keep before resampling for 52w stats
+        print(f"[AC] fetch OK source={source} shape={df.shape}")
+        print(f"[AC] index.dtype={df.index.dtype}  tz={df.index.tz}")
+        print(f"[AC] df.head:\n{df.head(3).to_string()}")
+
+        df_raw = df.copy()
 
         if timeframe == '1y':
+            print(f"[AC] resampling to monthly ...")
             df = _to_monthly(df)
+            print(f"[AC] after resample shape={df.shape}")
 
         if df is None or df.empty:
             result['error'] = f"데이터 리샘플링 실패: {sym}"
@@ -719,11 +739,9 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
             high_52w = float(df_52w['high'].max())
             low_52w  = float(df_52w['low'].min())
         elif timeframe == '1w':
-            # 60 weeks > 52 weeks; use directly
             high_52w = float(df_raw['high'].max())
             low_52w  = float(df_raw['low'].min())
         else:
-            # 1h / 4h / 12h: fetch a year of daily data for 52w stats
             df_1d = (fetch_binance_spot(sym, '1d', 365) or
                      fetch_bybit_spot(sym, '1d', 365))
             high_52w = float(df_1d['high'].max()) if df_1d is not None else None
@@ -732,7 +750,9 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
         label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
         title    = f"{sym} - {label} - {source}"
         tmp_path = _make_tmp_path()
+        print(f"[AC] calling _draw_chart title='{title}' tmp={tmp_path}")
         _draw_chart(df, title, timeframe, tmp_path)
+        print(f"[AC] _draw_chart done")
 
         lines = [
             f"📊 {sym} 차트",
@@ -750,7 +770,8 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
         result['caption']   = '\n'.join(lines)
 
     except Exception:
-        logger.error("create_clean_candlestick_chart 오류:\n%s", tb.format_exc())
+        tb.print_exc()
+        logger.exception("create_clean_candlestick_chart 오류 %s %s", sym, timeframe)
         result['error'] = "차트 생성 중 오류가 발생했습니다. 서버 로그를 확인하세요."
         plt.close('all')
 
@@ -813,7 +834,9 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
         label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
         title    = f"{sym} PERPS - {label} - {source}"
         tmp_path = _make_tmp_path()
+        print(f"[AP] calling _draw_chart title='{title}'")
         _draw_chart(df, title, timeframe, tmp_path)
+        print(f"[AP] _draw_chart done")
 
         lines = [
             f"📊 {sym} 선물 차트",
@@ -833,7 +856,8 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
         result['caption']   = '\n'.join(lines)
 
     except Exception:
-        logger.error("create_perps_chart 오류:\n%s", tb.format_exc())
+        tb.print_exc()
+        logger.exception("create_perps_chart 오류 %s %s", sym, timeframe)
         result['error'] = "선물 차트 생성 중 오류가 발생했습니다. 서버 로그를 확인하세요."
         plt.close('all')
 
