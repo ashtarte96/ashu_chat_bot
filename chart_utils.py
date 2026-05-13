@@ -401,12 +401,13 @@ _MARKET_SUFFIX: dict = {
 
 
 def _normalize_query(text: str) -> str:
-    """NFC, remove spaces + special chars, lowercase.
+    """NFC → remove spaces/special chars → lowercase.
     'TIGER 미국S&P500' → 'tiger미국sp500'
     '두산 에너빌리티'  → '두산에너빌리티'
+    '(주)LG&H'        → 'lgh'
     """
     text = unicodedata.normalize('NFC', text)
-    text = re.sub(r'[\s\-\_\./\(\)·&,]', '', text)
+    text = re.sub(r'[\s\-\_\./\(\)\[\]·&,+*%@#$!^~|]', '', text)
     return text.lower()
 
 
@@ -540,27 +541,30 @@ def _load_krx_excel() -> list:
     return results
 
 
+_NAVER_HEADERS = {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept-Language': 'ko-KR,ko;q=0.9',
+    'Referer':         'https://finance.naver.com/',
+}
+
+
 def _fetch_naver_etf_list() -> list:
     """
-    Naver Finance ETF 페이지에서 ETF 목록 스크래핑.
+    Naver Finance ETF 페이지에서 ETF 전체 목록 수집.
     https://finance.naver.com/sise/etf.naver
     Returns [(ticker, name, 'ETF'), ...]
-    최초 페이지만 로드 (약 50~100개); 캐시에 합산.
     """
     try:
         from bs4 import BeautifulSoup
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept-Language': 'ko-KR,ko;q=0.9',
-        }
         r = requests.get('https://finance.naver.com/sise/etf.naver',
-                         headers=headers, timeout=15)
+                         headers=_NAVER_HEADERS, timeout=15)
         r.encoding = 'euc-kr'
         soup = BeautifulSoup(r.text, 'lxml')
 
         results = []
         seen: set = set()
-        for a in soup.select('table td a[href*="code="]'):
+        # ETF 페이지의 메인 테이블 내 종목 링크
+        for a in soup.select('a[href*="item/main.naver?code="]'):
             href = a.get('href', '')
             m = re.search(r'code=(\d{6})', href)
             if not m:
@@ -573,11 +577,57 @@ def _fetch_naver_etf_list() -> list:
                 results.append((ticker, name, 'ETF'))
                 seen.add(ticker)
 
-        logger.info("[NAVER ETF] scraped %d ETFs", len(results))
+        print(f"[NAVER ETF LOAD] count={len(results)}")
         return results
     except Exception as e:
         logger.warning("[NAVER ETF] scrape failed: %s", e)
         return []
+
+
+def _load_naver_market(sosok: int, max_pages: int = 50) -> list:
+    """
+    Naver Finance sise_market_sum 에서 코스피(sosok=0)/코스닥(sosok=1) 전체 종목 수집.
+    각 페이지에서 종목코드+종목명 추출. 빈 페이지면 중단.
+    Returns [(ticker_6digit, name, market), ...]
+    """
+    from bs4 import BeautifulSoup
+    market = 'KOSPI' if sosok == 0 else 'KOSDAQ'
+    results = []
+    seen: set = set()
+
+    for page in range(1, max_pages + 1):
+        url = (
+            'https://finance.naver.com/sise/sise_market_sum.naver'
+            f'?sosok={sosok}&page={page}'
+        )
+        try:
+            r = requests.get(url, headers=_NAVER_HEADERS, timeout=15)
+            r.encoding = 'euc-kr'
+            soup = BeautifulSoup(r.text, 'lxml')
+
+            page_count = 0
+            for a in soup.select('table.type_2 td.name a'):
+                href = a.get('href', '')
+                m = re.search(r'code=(\d{6})', href)
+                if not m:
+                    continue
+                ticker = m.group(1)
+                name   = a.get_text(strip=True)
+                if ticker and name and ticker not in seen:
+                    results.append((ticker, name, market))
+                    seen.add(ticker)
+                    page_count += 1
+
+            if page_count == 0:
+                break  # 빈 페이지 → 마지막 페이지 지남
+
+        except Exception as e:
+            logger.warning("[NAVER %s] page=%d error: %s", market, page, e)
+            if page <= 2:
+                break  # 첫 페이지부터 실패 → 중단
+
+    print(f"[NAVER STOCK LOAD] {market} count={len(results)}")
+    return results
 
 
 def _fetch_naver_ohlcv(ticker: str, count: int = 365) -> pd.DataFrame:
@@ -662,11 +712,12 @@ _krx_cache: dict = {
 
 def _build_krx_cache() -> dict:
     """
-    Build cache from:
-      1. 상장법인목록.xls (KRX official Excel, ~2766 regular stocks)
-      2. Static ETF entries
-      3. Naver Finance ETF page (live scrape)
-      4. Static stock fallback (only when Excel is absent)
+    Build cache priority:
+      1. Naver Finance KOSPI/KOSDAQ (live, paginated)  ← primary
+      2. Naver Finance ETF page      (live)            ← primary
+      3. Static ETF list                               ← safety net
+      4. KRX Excel 상장법인목록.xls                    ← fallback (<500 stocks)
+      5. Static stock list                             ← last resort
     """
     by_norm: dict   = {}
     by_ticker: dict = {}
@@ -681,38 +732,55 @@ def _build_krx_cache() -> dict:
         if nn not in by_norm:
             by_norm[nn] = ticker
 
-    # ── 1. KRX Excel (regular stocks) ────────────────────────────────
-    excel_rows = _load_krx_excel()
-    kospi_count = kosdaq_count = konex_count = 0
-    for ticker, name, market in excel_rows:
+    # ── 1. Naver KOSPI + KOSDAQ ───────────────────────────────────────
+    kospi_count = kosdaq_count = 0
+    for ticker, name, market in _load_naver_market(0):
         _add(ticker, name, market)
-        if market == 'KOSPI':    kospi_count  += 1
-        elif market == 'KOSDAQ': kosdaq_count += 1
-        elif market == 'KONEX':  konex_count  += 1
+        kospi_count += 1
+    for ticker, name, market in _load_naver_market(1):
+        _add(ticker, name, market)
+        kosdaq_count += 1
 
-    # ── 2. Static ETFs ────────────────────────────────────────────────
+    # ── 2. Naver ETF page ─────────────────────────────────────────────
     etf_count = 0
-    for ticker, name, market in _STATIC_ETF_RAW:
-        before = len(entries)
-        _add(ticker, name, market)
-        if len(entries) > before:
-            etf_count += 1
-
-    # ── 3. Naver Finance ETF list (live) ─────────────────────────────
     for ticker, name, market in _fetch_naver_etf_list():
         before = len(entries)
         _add(ticker, name, market)
         if len(entries) > before:
             etf_count += 1
 
-    # ── 4. Static stock fallback (only if Excel failed) ──────────────
-    if not excel_rows:
+    # ── 3. Static ETFs (always include for reliability) ───────────────
+    for ticker, name, market in _STATIC_ETF_RAW:
+        before = len(entries)
+        _add(ticker, name, market)
+        if len(entries) > before:
+            etf_count += 1
+
+    # ── 4. KRX Excel fallback (Naver 수집 실패 시) ─────────────────────
+    konex_count = 0
+    if kospi_count + kosdaq_count < 500:
+        logger.warning(
+            "[KRX CACHE] Naver stocks %d+%d < 500 → Excel fallback",
+            kospi_count, kosdaq_count,
+        )
+        for ticker, name, market in _load_krx_excel():
+            _add(ticker, name, market)
+            if market == 'KOSPI':    kospi_count  += 1
+            elif market == 'KOSDAQ': kosdaq_count += 1
+            elif market == 'KONEX':  konex_count  += 1
+
+    # ── 5. Static stock list (최후 수단) ──────────────────────────────
+    if len(entries) < 50:
+        logger.warning("[KRX CACHE] only %d entries, using static stock list", len(entries))
         for ticker, name, market in _STATIC_STOCK_RAW:
             _add(ticker, name, market)
 
     total = len(entries)
-    print(f"[KRX CACHE] 총 {total}개: KOSPI={kospi_count} KOSDAQ={kosdaq_count} KONEX={konex_count} ETF={etf_count}")
-
+    print(
+        f"[KRX CACHE] 총 {total}개: "
+        f"KOSPI={kospi_count} KOSDAQ={kosdaq_count} "
+        f"KONEX={konex_count} ETF={etf_count}"
+    )
     return {
         'by_norm':    by_norm,
         'by_ticker':  by_ticker,
@@ -758,7 +826,7 @@ def find_kr_stock(query: str):
         if query_raw in cache['by_ticker']:
             name, market = cache['by_ticker'][query_raw]
             ticker_out = f"{query_raw}{_suffix(market)}"
-            print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+            print(f"[KR SEARCH] query={query_raw} matched={name} ticker={ticker_out} market={market}")
             return ticker_out, name
         return None, []
 
@@ -771,7 +839,7 @@ def find_kr_stock(query: str):
         if ticker:
             name, market = cache['by_ticker'][ticker]
             ticker_out = f"{ticker}{_suffix(market)}"
-            print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+            print(f"[KR SEARCH] query={query_raw} matched={name} ticker={ticker_out} market={market}")
             return ticker_out, name
 
     # ── 3. Exact normalized match ─────────────────────────────────────
@@ -799,7 +867,7 @@ def find_kr_stock(query: str):
     # ── 5. Fuzzy match ────────────────────────────────────────────────
     norm_names = cache['norm_names']
     if not norm_names:
-        print(f"[SEARCH]\nquery={query_raw}\nmatched=None\nticker=None")
+        print(f"[KR SEARCH] query={query_raw} matched=None")
         return None, []
 
     if _USE_RAPIDFUZZ:
@@ -824,12 +892,38 @@ def find_kr_stock(query: str):
             t, n = fuzzy_results[0]
             market = cache['by_ticker'][t][1]
             ticker_out = f"{t}{_suffix(market)}"
-            print(f"[SEARCH]\nquery={query_raw}\nmatched={n}\nticker={ticker_out}")
+            print(f"[KR SEARCH] query={query_raw} matched={n} ticker={ticker_out} market={market}")
             return ticker_out, n
         return None, fuzzy_results
 
-    print(f"[SEARCH]\nquery={query_raw}\nmatched=None\nticker=None")
+    print(f"[KR SEARCH] query={query_raw} matched=None")
     return None, []
+
+
+def search_kr_stock(query: str) -> dict:
+    """
+    Public API for Korean stock/ETF search. Returns structured result.
+
+    Success  → {'name': str, 'code': str, 'market': str, 'ticker': str}
+    Multiple → {'candidates': [{'name': str, 'code': str, 'market': str}, ...]}
+    Not found→ {}
+    """
+    ticker, result = find_kr_stock(query)
+    if ticker:
+        bare             = _bare_kr_ticker(ticker)
+        cache            = _get_krx_cache()
+        name_r, market_r = cache['by_ticker'].get(bare, (result, 'KOSPI'))
+        return {'name': name_r, 'code': bare, 'market': market_r, 'ticker': ticker}
+    if isinstance(result, list) and result:
+        cache = _get_krx_cache()
+        return {
+            'candidates': [
+                {'name': n, 'code': t,
+                 'market': cache['by_ticker'].get(t, (None, 'KOSPI'))[1]}
+                for t, n in result
+            ]
+        }
+    return {}
 
 
 def is_kr_ticker(ticker: str) -> bool:
@@ -841,6 +935,76 @@ def is_kr_ticker(ticker: str) -> bool:
 def _bare_kr_ticker(ticker: str) -> str:
     """Strip .KS / .KQ suffix → bare 6-digit pykrx code."""
     return ticker.split('.')[0]
+
+
+def fetch_naver_daily_ohlcv(code: str, pages: int = 7) -> pd.DataFrame:
+    """
+    Naver Finance 일별시세 페이지에서 OHLCV 수집 (pykrx 실패 시 fallback).
+    https://finance.naver.com/item/sise_day.naver?code={code}&page={page}
+
+    각 페이지 약 10행. pages=7이면 약 70행 (차트용 60봉 충분).
+    1w/1y 차트용으로는 pages를 크게 설정(예: 50~120).
+    Returns DataFrame [open, high, low, close, volume], UTC DatetimeIndex.
+    """
+    from bs4 import BeautifulSoup
+    bare = _bare_kr_ticker(code)
+    all_rows = []
+
+    for page in range(1, pages + 1):
+        url = f'https://finance.naver.com/item/sise_day.naver?code={bare}&page={page}'
+        try:
+            r = requests.get(url, headers=_NAVER_HEADERS, timeout=10)
+            r.encoding = 'euc-kr'
+            soup = BeautifulSoup(r.text, 'lxml')
+
+            table = soup.select_one('table.type2')
+            if not table:
+                break
+
+            page_rows = 0
+            for row in table.select('tr'):
+                tds = row.select('td')
+                if len(tds) < 7:
+                    continue
+                date_text = tds[0].get_text(strip=True)
+                if not re.match(r'\d{4}\.\d{2}\.\d{2}', date_text):
+                    continue
+                try:
+                    close_ = float(tds[1].get_text(strip=True).replace(',', ''))
+                    open_  = float(tds[3].get_text(strip=True).replace(',', ''))
+                    high_  = float(tds[4].get_text(strip=True).replace(',', ''))
+                    low_   = float(tds[5].get_text(strip=True).replace(',', ''))
+                    vol_   = float(re.sub(r'[^\d]', '', tds[6].get_text()) or '0')
+                    all_rows.append({
+                        'date': date_text,
+                        'open': open_, 'high': high_, 'low': low_,
+                        'close': close_, 'volume': vol_,
+                    })
+                    page_rows += 1
+                except (ValueError, AttributeError):
+                    continue
+
+            if page_rows == 0:
+                break  # 빈 페이지 → 종료
+
+        except Exception as e:
+            logger.warning("[NAVER DAILY] page=%d code=%s: %s", page, bare, e)
+            if page == 1:
+                raise  # 첫 페이지 실패면 즉시 raise
+
+    if not all_rows:
+        raise ValueError(f"[NAVER DAILY] no data for {bare}")
+
+    df = pd.DataFrame(all_rows)
+    df['dt'] = pd.to_datetime(df['date'], format='%Y.%m.%d', errors='coerce')
+    df = df.dropna(subset=['dt'])
+    df = df.sort_values('dt')  # ascending (oldest first)
+    df.index = df['dt'].dt.tz_localize('Asia/Seoul').dt.tz_convert('UTC')
+    df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+    df = df.dropna(subset=['open', 'close'])
+
+    print(f"[NAVER DAILY] {bare} pages={page} rows={len(df)}")
+    return df
 
 
 def fetch_kr_stock_ohlcv(ticker: str, timeframe: str) -> pd.DataFrame:
@@ -883,20 +1047,35 @@ def fetch_kr_stock_ohlcv(ticker: str, timeframe: str) -> pd.DataFrame:
         except Exception as e:
             logger.warning("[KR FETCH] ETF API failed for %s: %s", bare, e)
 
-    # Naver Finance fchart fallback
+    # Naver fchart fallback (XML API)
     if df is None or df.empty:
-        print(f"[KR FETCH] pykrx 모두 실패, Naver fchart 시도: {bare}")
+        print(f"[KR FETCH] pykrx 모두 실패 → Naver fchart 시도: {bare}")
         try:
-            df_naver = _fetch_naver_ohlcv(bare, count=days_back)
-            # Naver already returns English columns + UTC index → pass through
-            if df_naver is not None and not df_naver.empty:
-                print(f"[KR FETCH] Naver fchart OK: {bare} rows={len(df_naver)}")
-                return df_naver
+            df_fc = _fetch_naver_ohlcv(bare, count=days_back)
+            if df_fc is not None and not df_fc.empty:
+                print(f"[KR FETCH] Naver fchart OK: {bare} rows={len(df_fc)}")
+                return df_fc
         except Exception as e:
             logger.warning("[KR FETCH] Naver fchart failed for %s: %s", bare, e)
 
+    # Naver sise_day fallback (HTML 스크래핑, 가장 신뢰도 높음)
     if df is None or df.empty:
-        raise ValueError(f"데이터 없음: {bare}. pykrx/Naver 모두 실패. 상장 종목인지 확인하세요.")
+        print(f"[KR FETCH] Naver sise_day 시도: {bare}")
+        try:
+            daily_pages = {
+                '1h': 7, '4h': 7, '12h': 7, '1d': 7,
+                '1w': 50, '1y': 120,
+            }.get(timeframe, 7)
+            df_daily = fetch_naver_daily_ohlcv(bare, pages=daily_pages)
+            if df_daily is not None and not df_daily.empty:
+                return df_daily
+        except Exception as e:
+            logger.warning("[KR FETCH] Naver sise_day failed for %s: %s", bare, e)
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"데이터 없음: {bare}. pykrx/Naver fchart/sise_day 모두 실패."
+        )
 
     df = df.rename(columns={
         '시가': 'open', '고가': 'high', '저가': 'low',
