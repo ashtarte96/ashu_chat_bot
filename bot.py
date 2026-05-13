@@ -291,6 +291,54 @@ def _fetch_usdtkrw() -> float:
     raise ValueError("USDT/KRW 조회 실패")
 
 
+def _fetch_kospi_kosdaq() -> tuple:
+    """코스피·코스닥 현재가 (Naver Finance 스크래핑 → yfinance fallback)"""
+    try:
+        import re as _re
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get('https://finance.naver.com/sise/', headers=headers, timeout=10)
+        if r.status_code == 200:
+            html = r.text
+            kospi_m  = _re.search(r'KOSPI.*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)', html, _re.S)
+            kosdaq_m = _re.search(r'KOSDAQ.*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)', html, _re.S)
+            if kospi_m and kosdaq_m:
+                kospi  = float(kospi_m.group(1).replace(',', ''))
+                kosdaq = float(kosdaq_m.group(1).replace(',', ''))
+                if kospi > 100 and kosdaq > 100:
+                    return kospi, kosdaq
+    except Exception:
+        pass
+    # yfinance fallback
+    import yfinance as yf
+    kospi  = float(yf.Ticker('^KS11').fast_info['last_price'])
+    kosdaq = float(yf.Ticker('^KQ11').fast_info['last_price'])
+    return kospi, kosdaq
+
+
+def _fetch_nasdaq() -> float:
+    """나스닥 종합지수 (yfinance ^IXIC)"""
+    import yfinance as yf
+    return float(yf.Ticker('^IXIC').fast_info['last_price'])
+
+
+def _fetch_btc_dominance() -> float:
+    """BTC 도미넌스 (CoinGecko /api/v3/global)"""
+    r = requests.get(
+        'https://api.coingecko.com/api/v3/global',
+        timeout=15,
+    )
+    r.raise_for_status()
+    return float(r.json()['data']['market_cap_percentage']['btc'])
+
+
+def _fetch_fear_greed() -> tuple:
+    """공포탐욕지수 (alternative.me /fng/). (value_str, classification) 반환."""
+    r = requests.get('https://api.alternative.me/fng/', timeout=10)
+    r.raise_for_status()
+    d = r.json()['data'][0]
+    return d['value'], d['value_classification']
+
+
 # ═══════════════════════════════════════════════════
 # 신규 입장자 수학 인증
 # ═══════════════════════════════════════════════════
@@ -1431,7 +1479,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/kp → USD/KRW · USDT/KRW · 김치프리미엄"""
+    """/kp → 김프 & 주요지수 (USD/KRW, USDT/KRW, 코스피, 코스닥, 나스닥, BTC 도미넌스, 공포탐욕)"""
     if not update.message:
         return
 
@@ -1440,23 +1488,59 @@ async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(_KP_CACHE['text'])
         return
 
-    status = await update.message.reply_text("김치프리미엄 조회 중...")
+    status = await update.message.reply_text("📊 지수 조회 중...")
     try:
-        usdkrw, usdtkrw = await asyncio.gather(
+        results = await asyncio.gather(
             asyncio.to_thread(_fetch_usdkrw),
             asyncio.to_thread(_fetch_usdtkrw),
+            asyncio.to_thread(_fetch_kospi_kosdaq),
+            asyncio.to_thread(_fetch_nasdaq),
+            asyncio.to_thread(_fetch_btc_dominance),
+            asyncio.to_thread(_fetch_fear_greed),
+            return_exceptions=True,
         )
-        kp   = (usdtkrw / usdkrw - 1) * 100
-        sign = '+' if kp >= 0 else ''
-        text = (
-            "🇰🇷 김치프리미엄\n\n"
-            f"💵 USD/KRW:\n{usdkrw:,.2f}\n\n"
-            f"🪙 USDT/KRW:\n{usdtkrw:,.2f}\n\n"
-            f"📈 김프:\n{sign}{kp:.2f}%"
+        usdkrw_r, usdtkrw_r, kospi_kosdaq_r, nasdaq_r, btc_dom_r, fg_r = results
+
+        usdkrw  = float(usdkrw_r)  if not isinstance(usdkrw_r,  Exception) else None
+        usdtkrw = float(usdtkrw_r) if not isinstance(usdtkrw_r, Exception) else None
+
+        if usdkrw and usdtkrw:
+            kp = (usdtkrw / usdkrw - 1) * 100
+        else:
+            kp = None
+
+        kospi, kosdaq = (kospi_kosdaq_r if not isinstance(kospi_kosdaq_r, Exception)
+                         else (None, None))
+        nasdaq   = (float(nasdaq_r)  if not isinstance(nasdaq_r,  Exception) else None)
+        btc_dom  = (float(btc_dom_r) if not isinstance(btc_dom_r, Exception) else None)
+        fear_value, fear_class = (fg_r if not isinstance(fg_r, Exception) else (None, None))
+
+        def _fmt_float(v, fmt):
+            return format(v, fmt) if v is not None else 'N/A'
+
+        message = (
+            f"김프 & 주요지수\n\n"
+            f"💵 USD/KRW: {_fmt_float(usdkrw, ',.2f')}\n"
+            f"🪙 USDT/KRW: {_fmt_float(usdtkrw, ',.2f')}\n\n"
+            f"🇰🇷 김프: {(f'{kp:+.2f}%') if kp is not None else 'N/A'}\n\n"
+            f"🇰🇷 코스피: {_fmt_float(kospi, ',.2f')}\n"
+            f"🇰🇷 코스닥: {_fmt_float(kosdaq, ',.2f')}\n"
+            f"🇺🇸 나스닥: {_fmt_float(nasdaq, ',.2f')}\n\n"
+            f"👑 BTC 도미넌스: {_fmt_float(btc_dom, '.2f')}{'%' if btc_dom is not None else ''}\n"
+            f"😱 공포탐욕지수: {fear_value if fear_value else 'N/A'}"
+            f"{(' (' + fear_class + ')') if fear_class else ''}"
         )
-        logger.info("[KP] usdkrw=%.2f usdtkrw=%.2f kp=%.2f", usdkrw, usdtkrw, kp)
-        _KP_CACHE['text'] = text
+
+        logger.info(
+            "[KP] usdkrw=%.2f usdtkrw=%.2f kp=%s kospi=%s kosdaq=%s nasdaq=%s btc_dom=%s fg=%s/%s",
+            usdkrw or 0, usdtkrw or 0,
+            f"{kp:.2f}" if kp is not None else "N/A",
+            kospi, kosdaq, nasdaq, btc_dom, fear_value, fear_class,
+        )
+        _KP_CACHE['text'] = message
         _KP_CACHE['ts']   = now
+        text = message
+
     except Exception as e:
         logger.error("[KP] error: %s", e)
         text = f"❌ 조회 실패: {e}"
