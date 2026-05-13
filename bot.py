@@ -24,10 +24,15 @@ bot.py
 """
 
 import asyncio
+import json
 import logging
 import os
+import random
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
+
+import requests
 
 import pytz
 from telegram import (
@@ -83,6 +88,259 @@ logger = logging.getLogger(__name__)
 KST = pytz.timezone('Asia/Seoul')
 
 db = Database()
+
+
+# ═══════════════════════════════════════════════════
+# 광고문구 관리
+# ═══════════════════════════════════════════════════
+
+_AD_STATE_FILE  = 'ad_state.json'
+_SENT_MSGS_FILE = 'sent_messages.json'
+
+
+class AdManager:
+    """
+    광고문구 버전 관리 + 전송된 메시지 추적.
+    광고문구 변경 시 이전 메시지를 자동 수정/삭제한다.
+    """
+
+    def __init__(self):
+        self._load()
+
+    def _load(self):
+        try:
+            with open(_AD_STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.current_ad: str = data.get('current_ad', '')
+            self.version: int    = data.get('version', 0)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.current_ad = ''
+            self.version    = 0
+
+        try:
+            with open(_SENT_MSGS_FILE, 'r', encoding='utf-8') as f:
+                self._sent: dict = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._sent = {}
+
+    def _save_state(self):
+        try:
+            with open(_AD_STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'current_ad': self.current_ad, 'version': self.version},
+                          f, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[AD] state save failed: %s", e)
+
+    def _save_messages(self):
+        try:
+            with open(_SENT_MSGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._sent, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[AD] messages save failed: %s", e)
+
+    def set_ad(self, text: str) -> int:
+        self.current_ad = text.strip()
+        self.version   += 1
+        self._save_state()
+        return self.version
+
+    def clear_ad(self):
+        self.current_ad = ''
+        self.version   += 1
+        self._save_state()
+
+    def get_ad(self) -> str:
+        return self.current_ad
+
+    def build_caption(self, base: str) -> str:
+        if not self.current_ad:
+            return base
+        return f"{base}\n\n{self.current_ad}"
+
+    def record(self, chat_id: int, message_id: int, base_caption: str,
+               msg_type: str = 'photo'):
+        """광고문구가 붙은 메시지를 기록한다."""
+        if not self.current_ad:
+            return
+        key = str(chat_id)
+        if key not in self._sent:
+            self._sent[key] = []
+        self._sent[key].append({
+            'message_id':   message_id,
+            'ad_version':   self.version,
+            'base_caption': base_caption,
+            'msg_type':     msg_type,
+            'ts':           int(time.time()),
+        })
+        self._sent[key] = self._sent[key][-200:]   # 최근 200개만 유지
+        self._save_messages()
+
+    def outdated_entries(self, chat_id: int) -> list:
+        key = str(chat_id)
+        return [e for e in self._sent.get(key, [])
+                if e.get('ad_version') != self.version]
+
+    def all_chat_ids(self) -> list:
+        return [int(k) for k in self._sent]
+
+    def remove_entries(self, chat_id: int, message_ids: list):
+        key = str(chat_id)
+        if key not in self._sent:
+            return
+        id_set = set(message_ids)
+        self._sent[key] = [e for e in self._sent[key]
+                           if e['message_id'] not in id_set]
+        self._save_messages()
+
+
+ad_manager = AdManager()
+
+# ── 이전 광고문구 메시지 일괄 정리 ─────────────────────────────────────────
+
+async def cleanup_old_ads(bot) -> None:
+    """
+    버전이 다른 광고문구가 붙은 메시지를 수정(edit) 또는 삭제(delete).
+    Rate limit을 피하기 위해 메시지 사이 0.1초 대기.
+    """
+    for chat_id in ad_manager.all_chat_ids():
+        outdated = ad_manager.outdated_entries(chat_id)
+        if not outdated:
+            continue
+        edited = deleted = skipped = 0
+        processed: list = []
+        for entry in outdated:
+            msg_id       = entry['message_id']
+            base_caption = entry.get('base_caption', '')
+            msg_type     = entry.get('msg_type', 'photo')
+            new_caption  = ad_manager.build_caption(base_caption)
+            try:
+                if msg_type == 'photo':
+                    await bot.edit_message_caption(
+                        chat_id=chat_id, message_id=msg_id, caption=new_caption,
+                    )
+                else:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id, text=new_caption,
+                    )
+                edited += 1
+            except Exception:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                    deleted += 1
+                except Exception:
+                    skipped += 1
+            processed.append(msg_id)
+            await asyncio.sleep(0.1)
+        ad_manager.remove_entries(chat_id, processed)
+        logger.info("[AD CLEANUP] chat=%d edited=%d deleted=%d skipped=%d",
+                    chat_id, edited, deleted, skipped)
+
+
+# ═══════════════════════════════════════════════════
+# 김치프리미엄 (/kp)
+# ═══════════════════════════════════════════════════
+
+_KP_CACHE: dict = {'text': None, 'ts': 0.0}
+_KP_TTL = 10   # 캐시 유효시간 (초)
+
+
+def _fetch_usdkrw() -> float:
+    """USD/KRW 환율 (exchangerate-api → open.er-api 순서로 시도)"""
+    for url in (
+        'https://api.exchangerate-api.com/v4/latest/USD',
+        'https://open.er-api.com/v6/latest/USD',
+    ):
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                rate = (d.get('rates') or d.get('conversion_rates') or {}).get('KRW')
+                if rate:
+                    return float(rate)
+        except Exception:
+            continue
+    raise ValueError("USD/KRW 환율 조회 실패")
+
+
+def _fetch_usdtkrw() -> float:
+    """USDT/KRW (업비트 → 빗썸 fallback)"""
+    try:
+        r = requests.get(
+            'https://api.upbit.com/v1/ticker',
+            params={'markets': 'KRW-USDT'},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data and isinstance(data, list):
+                return float(data[0]['trade_price'])
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            'https://api.bithumb.com/public/ticker/USDT_KRW',
+            timeout=10,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            price = data.get('data', {}).get('closing_price')
+            if price:
+                return float(price)
+    except Exception:
+        pass
+    raise ValueError("USDT/KRW 조회 실패")
+
+
+# ═══════════════════════════════════════════════════
+# 신규 입장자 수학 인증
+# ═══════════════════════════════════════════════════
+
+_pending_verification: dict = {}
+# user_id → {chat_id, answer, question, task, msg_id}
+
+_FULL_PERMISSIONS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+)
+
+
+def _make_captcha() -> tuple:
+    """간단한 사칙연산 문제 생성. (question_str, answer) 반환."""
+    a   = random.randint(1, 10)
+    b   = random.randint(1, 10)
+    op  = random.choice(['+', '-'])
+    if op == '-' and b > a:
+        a, b = b, a   # 음수 방지
+    answer = (a + b) if op == '+' else (a - b)
+    return f"{a} {op} {b}", answer
+
+
+def _captcha_keyboard(user_id: int, answer: int) -> InlineKeyboardMarkup:
+    """정답 1개 + 오답 3개로 구성된 2×2 버튼 그리드."""
+    choices = {answer}
+    attempts = 0
+    while len(choices) < 4 and attempts < 30:
+        decoy = answer + random.randint(-6, 6)
+        if decoy != answer and decoy >= 0:
+            choices.add(decoy)
+        attempts += 1
+    while len(choices) < 4:
+        choices.add(max(choices) + 1)
+    lst = list(choices)
+    random.shuffle(lst)
+    buttons = [
+        InlineKeyboardButton(str(v), callback_data=f"captcha:{user_id}:{v}")
+        for v in lst
+    ]
+    return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
 # ═══════════════════════════════════════════════════
@@ -920,14 +1178,18 @@ async def _send_chart_result(
         await update.message.reply_text(result.get('error', '차트 생성에 실패했습니다.'))
         return
 
-    # chart_utils가 caption을 만들어 줬으면 그대로 사용, 없으면 간단하게 생성
-    caption = result.get('caption') or (
-        f"📊 {result['symbol']}  {result['timeframe']}"
-    )
+    base_caption = result.get('caption') or f"📊 {result['symbol']}  {result['timeframe']}"
+    caption      = ad_manager.build_caption(base_caption)
 
     try:
         with open(result['file_path'], 'rb') as f:
-            await update.message.reply_photo(photo=f, caption=caption)
+            sent = await update.message.reply_photo(photo=f, caption=caption)
+        ad_manager.record(
+            chat_id=update.effective_chat.id,
+            message_id=sent.message_id,
+            base_caption=base_caption,
+            msg_type='photo',
+        )
     except Exception as e:
         logger.error("차트 전송 실패: %s", e)
         await update.message.reply_text(f"차트 전송 실패: {e}")
@@ -1032,10 +1294,17 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if ticker:
             name = result
             print(f"[AK] ticker={ticker} name={name} tf={timeframe}")
-            chart_path, caption = create_kr_stock_chart(ticker, name, timeframe)
+            chart_path, base_caption = create_kr_stock_chart(ticker, name, timeframe)
+            caption = ad_manager.build_caption(base_caption)
             try:
                 with open(chart_path, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption=caption)
+                    sent = await update.message.reply_photo(photo=f, caption=caption)
+                ad_manager.record(
+                    chat_id=update.effective_chat.id,
+                    message_id=sent.message_id,
+                    base_caption=base_caption,
+                    msg_type='photo',
+                )
             finally:
                 try:
                     os.remove(chart_path)
@@ -1131,6 +1400,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/unmute user_id → 직접 해제\n"
         "\n"
         "📈 시세 / 차트\n"
+        "/kp → 김치프리미엄 (USD/KRW · USDT/KRW)\n"
         "/ac BTC → 코인 현물 차트 (Binance/Bybit)\n"
         "/ac BTC 4h → 인터벌 지정\n"
         "/ap BTC → 코인 선물(PERPS) 차트 + 펀딩비\n"
@@ -1142,10 +1412,279 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y\n"
         "(한국 주식: 1h/4h/12h 요청 시 일봉으로 대체)\n"
         "\n"
+        "📣 광고문구 (관리자)\n"
+        "/setad 문구 → 광고문구 설정 (이전 메시지 자동 업데이트)\n"
+        "/setad → 현재 광고문구 확인\n"
+        "/clearad → 광고문구 삭제\n"
+        "\n"
+        "🔒 신규 입장자 인증\n"
+        "새 멤버 입장 시 수학 문제 자동 출제 (10초 제한)\n"
+        "\n"
         "🔧 디버그 (관리자)\n"
         "/nettest → 서버 네트워크 접근 테스트"
     )
     await update.message.reply_text(text)
+
+
+# ═══════════════════════════════════════════════════
+# /kp 명령어 (김치프리미엄)
+# ═══════════════════════════════════════════════════
+
+async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/kp → USD/KRW · USDT/KRW · 김치프리미엄"""
+    if not update.message:
+        return
+
+    now = time.time()
+    if _KP_CACHE['text'] and now - _KP_CACHE['ts'] < _KP_TTL:
+        await update.message.reply_text(_KP_CACHE['text'])
+        return
+
+    status = await update.message.reply_text("김치프리미엄 조회 중...")
+    try:
+        usdkrw, usdtkrw = await asyncio.gather(
+            asyncio.to_thread(_fetch_usdkrw),
+            asyncio.to_thread(_fetch_usdtkrw),
+        )
+        kp   = (usdtkrw / usdkrw - 1) * 100
+        sign = '+' if kp >= 0 else ''
+        text = (
+            "🇰🇷 김치프리미엄\n\n"
+            f"💵 USD/KRW:\n{usdkrw:,.2f}\n\n"
+            f"🪙 USDT/KRW:\n{usdtkrw:,.2f}\n\n"
+            f"📈 김프:\n{sign}{kp:.2f}%"
+        )
+        logger.info("[KP] usdkrw=%.2f usdtkrw=%.2f kp=%.2f", usdkrw, usdtkrw, kp)
+        _KP_CACHE['text'] = text
+        _KP_CACHE['ts']   = now
+    except Exception as e:
+        logger.error("[KP] error: %s", e)
+        text = f"❌ 조회 실패: {e}"
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    await update.message.reply_text(text)
+
+
+# ═══════════════════════════════════════════════════
+# /setad · /clearad 명령어 (광고문구 관리, 관리자 전용)
+# ═══════════════════════════════════════════════════
+
+async def cmd_setad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setad 문구 → 광고문구 설정. 인자 없으면 현재 문구 표시."""
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    if not context.args:
+        cur = ad_manager.get_ad()
+        if cur:
+            await update.message.reply_text(f"현재 광고문구 (v{ad_manager.version}):\n\n{cur}")
+        else:
+            await update.message.reply_text(
+                "현재 설정된 광고문구가 없습니다.\n사용법: /setad 광고문구"
+            )
+        return
+
+    new_text = ' '.join(context.args)
+    version  = ad_manager.set_ad(new_text)
+    await update.message.reply_text(
+        f"✅ 광고문구가 설정되었습니다. (v{version})\n\n{new_text}\n\n"
+        "이전 메시지 업데이트를 시작합니다..."
+    )
+    asyncio.create_task(cleanup_old_ads(context.bot))
+
+
+async def cmd_clearad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/clearad → 광고문구 삭제."""
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    ad_manager.clear_ad()
+    await update.message.reply_text("✅ 광고문구가 삭제되었습니다.")
+    asyncio.create_task(cleanup_old_ads(context.bot))
+
+
+# ═══════════════════════════════════════════════════
+# 신규 입장자 수학 인증
+# ═══════════════════════════════════════════════════
+
+async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """새 멤버 입장 → 즉시 채팅 제한 + 수학 인증 버튼 전송."""
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+
+    for member in msg.new_chat_members:
+        if member.is_bot:
+            continue
+        user_id = member.id
+        chat_id = msg.chat_id
+
+        # 관리자 제외
+        try:
+            m = await context.bot.get_chat_member(chat_id, user_id)
+            if m.status in ('administrator', 'creator'):
+                continue
+        except Exception:
+            pass
+
+        # 즉시 채팅 제한
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions(can_send_messages=False),
+            )
+        except Exception as e:
+            logger.warning("[VERIFY] restrict failed user=%d: %s", user_id, e)
+
+        # 기존 인증 대기 중이면 취소
+        if user_id in _pending_verification:
+            old = _pending_verification.pop(user_id)
+            if 'task' in old:
+                old['task'].cancel()
+            try:
+                await context.bot.delete_message(old['chat_id'], old['msg_id'])
+            except Exception:
+                pass
+
+        # 문제 생성 + 메시지 전송
+        question, answer = _make_captcha()
+        keyboard  = _captcha_keyboard(user_id, answer)
+        name_str  = member.first_name or str(user_id)
+
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🤖 [{name_str}] 님 환영합니다!\n\n"
+                f"🧮 인증 문제: {question} = ?\n\n"
+                "⏱ 10초 안에 정답 버튼을 눌러주세요.\n"
+                "시간 초과 시 자동 퇴장 처리됩니다."
+            ),
+            reply_markup=keyboard,
+        )
+
+        task = asyncio.create_task(
+            _verification_timeout(context.bot, chat_id, user_id, sent.message_id)
+        )
+        _pending_verification[user_id] = {
+            'chat_id':  chat_id,
+            'answer':   answer,
+            'question': question,
+            'task':     task,
+            'msg_id':   sent.message_id,
+        }
+        logger.info("[VERIFY] user=%d question=%s", user_id, question)
+
+
+async def _verification_timeout(bot, chat_id: int, user_id: int, msg_id: int) -> None:
+    """10초 후 인증 미완료 시 퇴장 처리."""
+    await asyncio.sleep(10)
+    if user_id not in _pending_verification:
+        return   # 이미 인증 완료
+
+    del _pending_verification[user_id]
+    logger.info("[VERIFY] user=%d result=timeout_kick", user_id)
+
+    try:
+        await bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+    try:
+        await bot.ban_chat_member(chat_id, user_id)
+        await asyncio.sleep(0.5)
+        await bot.unban_chat_member(chat_id, user_id)   # 재입장 허용
+    except Exception as e:
+        logger.warning("[VERIFY] kick failed user=%d: %s", user_id, e)
+        return
+
+    try:
+        notice = await bot.send_message(
+            chat_id,
+            "⏰ 인증 시간 초과로 퇴장 처리되었습니다. 재입장 후 다시 시도하세요.",
+        )
+        await asyncio.sleep(5)
+        await notice.delete()
+    except Exception:
+        pass
+
+
+async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    수학 인증 버튼 클릭 처리.
+    callback_data 형식: captcha:{user_id}:{clicked_value}
+    """
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    try:
+        _, uid_str, val_str = query.data.split(':')
+        target_uid = int(uid_str)
+        clicked    = int(val_str)
+    except (ValueError, AttributeError):
+        return
+
+    # 클릭한 사람이 인증 대상인지 확인
+    if query.from_user.id != target_uid:
+        await query.answer("이 인증은 다른 사용자의 것입니다.", show_alert=True)
+        return
+
+    entry = _pending_verification.get(target_uid)
+    if not entry:
+        try:
+            await query.edit_message_text("이미 처리된 인증입니다.")
+        except Exception:
+            pass
+        return
+
+    if clicked == entry['answer']:
+        # 정답 → 제한 해제 + 환영
+        entry['task'].cancel()
+        del _pending_verification[target_uid]
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=entry['chat_id'],
+                user_id=target_uid,
+                permissions=_FULL_PERMISSIONS,
+            )
+        except Exception as e:
+            logger.error("[VERIFY] restore permissions failed user=%d: %s", target_uid, e)
+
+        name_str = query.from_user.first_name or str(target_uid)
+        try:
+            await query.edit_message_text(f"✅ {name_str} 님, 인증 완료! 환영합니다 🎉")
+        except Exception:
+            pass
+        logger.info("[VERIFY] user=%d result=success", target_uid)
+
+    else:
+        # 오답 → 새 문제로 교체 (타이머 유지)
+        question, answer = _make_captcha()
+        keyboard = _captcha_keyboard(target_uid, answer)
+        entry['answer']   = answer
+        entry['question'] = question
+        try:
+            await query.edit_message_text(
+                f"❌ 틀렸습니다! 다시 시도하세요.\n\n"
+                f"🧮 새 문제: {question} = ?\n\n"
+                "⏱ 남은 시간 내에 정답 버튼을 눌러주세요.",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+        logger.info("[VERIFY] user=%d wrong clicked=%d expected=%d",
+                    target_uid, clicked, entry['answer'])
 
 
 # ═══════════════════════════════════════════════════
@@ -1233,10 +1772,21 @@ def main() -> None:
     app.add_handler(CommandHandler('ap',        cmd_ap))
     app.add_handler(CommandHandler('ak',        ak_chart))
     app.add_handler(CommandHandler('au',        cmd_au))
+    app.add_handler(CommandHandler('kp',        cmd_kp))
+    app.add_handler(CommandHandler('setad',     cmd_setad))
+    app.add_handler(CommandHandler('clearad',   cmd_clearad))
 
     # InlineKeyboard 콜백 핸들러
     app.add_handler(
         CallbackQueryHandler(delete_banword_callback, pattern=r'^del_banword:\d+$')
+    )
+    app.add_handler(
+        CallbackQueryHandler(handle_captcha_callback, pattern=r'^captcha:\d+:\d+$')
+    )
+
+    # 신규 입장자 인증 핸들러
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member)
     )
 
     # 일반 텍스트 메시지 핸들러 (명령어 제외)
