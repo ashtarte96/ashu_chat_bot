@@ -1297,8 +1297,15 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     if df.empty:
         raise ValueError(f"차트 데이터 없음: {bare}")
 
+    # 시장 정보 캐시에서 조회 (KIS API 호출 전에 결정)
+    try:
+        cache  = _get_krx_cache()
+        _, market = cache['by_ticker'].get(bare, (name, ''))
+    except Exception:
+        market = ''
+
     # ── 현재가: KIS API 우선, 실패 시 pykrx 마지막 종가 ──────────────
-    kis = fetch_kis_stock_price(bare)
+    kis = fetch_kis_stock_price(bare, market=market)
     if kis and kis['price'] > 0:
         current_price = float(kis['price'])
         change_pct    = kis['change_pct']
@@ -1314,14 +1321,7 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
         last_row      = df_raw.tail(1)
         volume        = int(last_row['volume'].iloc[0]) if 'volume' in df_raw.columns and not last_row.empty else 0
         price_source  = 'pykrx'
-        print(f"[KR CHART] pykrx 마지막 종가: ₩{current_price:,.0f} (KIS API 미설정)")
-
-    # 시장 정보 캐시에서 조회
-    try:
-        cache  = _get_krx_cache()
-        _, market = cache['by_ticker'].get(bare, (name, ''))
-    except Exception:
-        market = ''
+        print(f"[KR CHART] pykrx 마지막 종가: ₩{current_price:,.0f} (KIS API 미설정/실패)")
 
     tf_label = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
 
@@ -1552,22 +1552,19 @@ def get_kis_access_token() -> 'str | None':
         return None
 
 
-def fetch_kis_stock_price(code: str) -> 'dict | None':
+def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
     """
     한국투자증권 OpenAPI 현재가 조회 (TR_ID: FHKST01010100).
-    code: 6자리 종목코드 (예: '328130')
 
-    Returns:
-        {
-          'price': int,         # 현재가
-          'change': int,        # 전일대비 금액
-          'change_pct': float,  # 등락률 (%)
-          'volume': int,        # 누적거래량
-          'open': int,          # 시가
-          'high': int,          # 고가
-          'low': int,           # 저가
-        }
-    or None if API unavailable or failed.
+    code  : 6자리 종목코드 (예: '328130')
+    market: 'KOSPI' | 'KOSDAQ' | 'ETF' | '' (빈 값이면 캐시에서 자동 조회)
+
+    시장 코드:
+      KOSPI  → fid_cond_mrkt_div_code = 'J'
+      KOSDAQ → fid_cond_mrkt_div_code = 'Q'
+      ETF    → 'J' 시도 후 실패 시 'Q' fallback
+
+    Returns dict or None.
     """
     token = get_kis_access_token()
     if not token:
@@ -1576,73 +1573,118 @@ def fetch_kis_stock_price(code: str) -> 'dict | None':
     app_key    = os.getenv('KIS_APP_KEY', '').strip()
     app_secret = os.getenv('KIS_APP_SECRET', '').strip()
 
-    try:
-        r = requests.get(
-            f'{_KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-price',
-            headers={
-                'authorization': f'Bearer {token}',
-                'appkey':        app_key,
-                'appsecret':     app_secret,
-                'tr_id':         'FHKST01010100',
-                'custtype':      'P',
-                'Content-Type':  'application/json; charset=utf-8',
-            },
-            params={
-                'FID_COND_MRKT_DIV_CODE': 'J',
-                'FID_INPUT_ISCD':         code,
-            },
-            timeout=10,
-        )
-        if r.status_code != 200:
-            logger.error("[KIS PRICE] %s HTTP %d: %s", code, r.status_code, r.text[:200])
-            return None
-        j = r.json()
-        if j.get('rt_cd') != '0':
-            logger.error("[KIS PRICE] %s rt_cd=%s msg=%s", code, j.get('rt_cd'), j.get('msg1'))
-            return None
+    # ── 시장 코드 결정 ────────────────────────────────────────────────
+    if not market:
+        try:
+            cache = _get_krx_cache()
+            _, market = cache['by_ticker'].get(code, (code, 'KOSPI'))
+        except Exception:
+            market = 'KOSPI'
 
-        out = j.get('output', {})
+    _MKT_CODE = {'KOSPI': 'J', 'KOSDAQ': 'Q', 'ETF': 'J', 'KONEX': 'J'}
+    primary   = _MKT_CODE.get(market, 'J')
+    # fallback 순서: 주 시장 코드 → 반대 코드 (J↔Q) → ETF 특수 처리
+    if primary == 'J':
+        candidates = ['J', 'Q']
+    else:
+        candidates = ['Q', 'J']
 
-        def _int(key: str) -> int:
-            try:
-                return int(out.get(key) or 0)
-            except (ValueError, TypeError):
-                return 0
+    def _int(d: dict, key: str) -> int:
+        try:
+            return int(d.get(key) or 0)
+        except (ValueError, TypeError):
+            return 0
 
-        def _float(key: str) -> float:
-            try:
-                return float(out.get(key) or 0.0)
-            except (ValueError, TypeError):
-                return 0.0
+    def _float(d: dict, key: str) -> float:
+        try:
+            return float(d.get(key) or 0.0)
+        except (ValueError, TypeError):
+            return 0.0
 
-        price      = _int('stck_prpr')
-        change     = _int('prdy_vrss')
-        change_pct = _float('prdy_ctrt')
-        volume     = _int('acml_vol')
-        open_p     = _int('stck_oprc')
-        high_p     = _int('stck_hgpr')
-        low_p      = _int('stck_lwpr')
+    headers = {
+        'authorization': f'Bearer {token}',
+        'appkey':        app_key,
+        'appsecret':     app_secret,
+        'tr_id':         'FHKST01010100',
+        'custtype':      'P',
+        'Content-Type':  'application/json; charset=utf-8',
+    }
 
-        # sign 보정: prdy_vrss_sign 4/5 = 하락
-        sign = out.get('prdy_vrss_sign', '3')
-        if sign in ('4', '5'):
-            change     = -abs(change)
-            change_pct = -abs(change_pct)
+    for mrkt_code in candidates:
+        print(f"[KIS REQUEST] code={code} market={market} fid_cond_mrkt_div_code={mrkt_code}")
+        try:
+            r = requests.get(
+                f'{_KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-price',
+                headers=headers,
+                params={
+                    'fid_cond_mrkt_div_code': mrkt_code,  # 소문자 필수
+                    'fid_input_iscd':         code,
+                },
+                timeout=10,
+            )
+            print(f"[KIS RESPONSE] HTTP {r.status_code}")
+            if r.status_code != 200:
+                logger.error("[KIS PRICE] %s HTTP %d: %s", code, r.status_code, r.text[:300])
+                continue
 
-        logger.info("[KIS PRICE] code=%s price=%s change_pct=%s%%", code, price, change_pct)
-        print(f"[KIS PRICE] code={code} price={price:,} change_pct={change_pct:+.2f}%")
-        return {
-            'price':      price,
-            'change':     change,
-            'change_pct': change_pct,
-            'volume':     volume,
-            'open':       open_p,
-            'high':       high_p,
-            'low':        low_p,
-        }
-    except Exception as e:
-        logger.error("[KIS PRICE] %s 조회 실패: %s", code, e)
-        return None
+            j      = r.json()
+            rt_cd  = j.get('rt_cd',  '?')
+            msg_cd = j.get('msg_cd', '')
+            msg1   = j.get('msg1',   '')
+            print(f"[KIS RESPONSE] rt_cd={rt_cd} msg_cd={msg_cd} msg1={msg1}")
+
+            if rt_cd != '0':
+                logger.error(
+                    "[KIS PRICE] %s mrkt=%s rt_cd=%s msg_cd=%s msg1=%s",
+                    code, mrkt_code, rt_cd, msg_cd, msg1,
+                )
+                # 종목코드 오류류면 fallback 불필요
+                if msg_cd in ('OPSP0003U', 'EGW00123'):
+                    break
+                continue  # 다른 시장 코드로 재시도
+
+            out   = j.get('output', {})
+            price = _int(out, 'stck_prpr')
+
+            if price == 0:
+                # 시장 닫힘 등으로 0 반환 → 다른 코드 시도
+                print(f"[KIS RESPONSE] price=0 for {code} mrkt={mrkt_code} → next candidate")
+                continue
+
+            change     = _int(out,   'prdy_vrss')
+            change_pct = _float(out, 'prdy_ctrt')
+            volume     = _int(out,   'acml_vol')
+            open_p     = _int(out,   'stck_oprc')
+            high_p     = _int(out,   'stck_hgpr')
+            low_p      = _int(out,   'stck_lwpr')
+
+            # prdy_vrss_sign: 1=상한 2=상승 3=보합 4=하한 5=하락
+            sign_code = out.get('prdy_vrss_sign', '3')
+            if sign_code in ('4', '5'):
+                change     = -abs(change)
+                change_pct = -abs(change_pct)
+            else:
+                change     = abs(change)
+                change_pct = abs(change_pct) if sign_code in ('1', '2') else change_pct
+
+            logger.info("[KIS PRICE] code=%s price=%s change_pct=%s%%", code, price, change_pct)
+            print(f"[KIS PRICE] code={code} mrkt={mrkt_code} price={price:,} change_pct={change_pct:+.2f}%")
+            return {
+                'price':      price,
+                'change':     change,
+                'change_pct': change_pct,
+                'volume':     volume,
+                'open':       open_p,
+                'high':       high_p,
+                'low':        low_p,
+                'mrkt_code':  mrkt_code,
+            }
+
+        except Exception as e:
+            logger.error("[KIS PRICE] %s mrkt=%s 오류: %s", code, mrkt_code, e)
+
+    logger.warning("[KIS PRICE] %s: 모든 시장 코드 실패", code)
+    return None
 
 
 # ── Korean exchange price fetchers ────────────────────────────────────
