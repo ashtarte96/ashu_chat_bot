@@ -664,15 +664,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    두 가지 모드:
-      [답글 모드]  광고 메시지에 답글로 /bw  → 해당 메시지 텍스트를 차단 문구로 등록 + 삭제 + mute
-      [직접 모드]  /bw 광고문구              → "광고문구"를 차단 문구로 등록
+    세 가지 모드:
+      [답글 모드]  메시지에 답글로 /bw         → 해당 메시지를 차단 문구로 등록 + 삭제 + mute
+      [광고 설정]  /bw <문구>                  → 광고문구 설정 + 이전 메시지 자동 cleanup
+      [광고 초기화] /bw clear                  → 광고문구 삭제 + 이전 메시지 cleanup
+      [조회]       /bw (인자 없음, 답글 없음)  → 현재 광고문구 출력
     """
     if not update.message:
         return
 
     try:
-        # 관리자 체크 (직접 API 호출)
         member = await context.bot.get_chat_member(
             update.effective_chat.id,
             update.effective_user.id,
@@ -682,78 +683,57 @@ async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         reply_msg = update.message.reply_to_message
-        word = None
 
-        # 1순위: 답글 대상 메시지의 텍스트
+        # ── 답글 모드: 스팸 메시지 blacklist + 삭제 + mute ────────────
         if reply_msg:
             raw = (reply_msg.text or reply_msg.caption or '').strip()
-            if raw:
-                word = raw[:200]
+            word = raw[:200] if raw else None
 
-        # 2순위: /bw 뒤 직접 입력한 인자
-        if not word and context.args:
-            word = ' '.join(context.args).strip()
+            if not word:
+                await update.message.reply_text("답글 메시지에 텍스트가 없습니다.")
+                return
 
-        # 둘 다 없으면 사용법 안내
-        if not word:
-            await update.message.reply_text(
-                "형식: /bw 광고문구 또는 광고 메시지에 답글로 /bw"
-            )
-            return
-
-        if reply_msg:
             print(f"[BANWORD REPLY ADD] word='{word}'")
-        else:
-            print(f"[BANWORD ADD] word='{word}'")
+            added = db.add_blocked_word(word)
+            result_msg = (
+                f"차단 문구가 추가되었습니다: {word}"
+                if added else
+                f"이미 등록된 문구입니다: {word}"
+            )
 
-        added = db.add_blocked_word(word)
-        result_msg = (
-            f"차단 문구가 추가되었습니다: {word}"
-            if added else
-            f"이미 등록된 문구입니다: {word}"
-        )
+            if reply_msg.from_user and not reply_msg.from_user.is_bot:
+                try:
+                    await reply_msg.delete()
+                    print(f"[SPAM MESSAGE DELETED] message_id={reply_msg.message_id}")
+                except Exception as e:
+                    result_msg += f"\n원본 메시지 삭제 실패: {e}"
 
-        # 답글 방식: 원본 삭제 + mute
-        if reply_msg and reply_msg.from_user and not reply_msg.from_user.is_bot:
-
-            # 원본 메시지 삭제
-            try:
-                await reply_msg.delete()
-                print(f"[SPAM MESSAGE DELETED] message_id={reply_msg.message_id}")
-            except Exception as e:
-                result_msg += f"\n원본 메시지 삭제 실패: {e}"
-
-            # 원본 작성자 mute
-            try:
-                target_member = await context.bot.get_chat_member(
-                    update.effective_chat.id,
-                    reply_msg.from_user.id,
-                )
-                if target_member.status in ('administrator', 'creator'):
-                    result_msg += "\n대상 사용자가 관리자라 mute할 수 없습니다."
-                else:
-                    until_date = datetime.now(timezone.utc) + timedelta(hours=MUTE_HOURS)
-                    await context.bot.restrict_chat_member(
-                        chat_id=update.effective_chat.id,
-                        user_id=reply_msg.from_user.id,
-                        permissions=ChatPermissions(can_send_messages=False),
-                        until_date=until_date,
+                try:
+                    target_member = await context.bot.get_chat_member(
+                        update.effective_chat.id,
+                        reply_msg.from_user.id,
                     )
-                    print(f"[SPAM USER MUTED] user={reply_msg.from_user.id}")
-                    result_msg += "\n원본 메시지 삭제 및 사용자 mute 완료"
-            except Exception as e:
-                result_msg += f"\n사용자 mute 실패: {e}"
+                    if target_member.status in ('administrator', 'creator'):
+                        result_msg += "\n대상 사용자가 관리자라 mute할 수 없습니다."
+                    else:
+                        until_date = datetime.now(timezone.utc) + timedelta(hours=MUTE_HOURS)
+                        await context.bot.restrict_chat_member(
+                            chat_id=update.effective_chat.id,
+                            user_id=reply_msg.from_user.id,
+                            permissions=ChatPermissions(can_send_messages=False),
+                            until_date=until_date,
+                        )
+                        print(f"[SPAM USER MUTED] user={reply_msg.from_user.id}")
+                        result_msg += "\n원본 메시지 삭제 및 사용자 mute 완료"
+                except Exception as e:
+                    result_msg += f"\n사용자 mute 실패: {e}"
 
-            # 관리자의 /bw 명령어 메시지 삭제 시도
             try:
                 await update.message.delete()
             except Exception:
                 pass
-
-            sent = await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=result_msg,
-            )
+            sent = await context.bot.send_message(chat_id=update.effective_chat.id,
+                                                   text=result_msg)
             await asyncio.sleep(3)
             try:
                 await sent.delete()
@@ -761,8 +741,55 @@ async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
             return
 
-        # 직접 입력 방식: 결과만 reply
-        sent = await update.message.reply_text(result_msg)
+        # ── 직접 모드: 광고문구 관리 ──────────────────────────────────
+        args_text = ' '.join(context.args).strip() if context.args else ''
+
+        # /bw (인자 없음) → 현재 광고문구 출력
+        if not args_text:
+            cur = ad_manager.get_ad()
+            if cur:
+                await update.message.reply_text(
+                    f"현재 광고문구 (v{ad_manager.version}):\n\n{cur}\n\n"
+                    "/bw 새문구 → 변경   /bw clear → 삭제"
+                )
+            else:
+                await update.message.reply_text(
+                    "현재 설정된 광고문구가 없습니다.\n\n"
+                    "/bw 문구 → 광고문구 설정"
+                )
+            return
+
+        # /bw clear → 광고문구 삭제
+        if args_text.lower() == 'clear':
+            ad_manager.clear_ad()
+            print(f"[BW UPDATE] 광고문구 삭제 → new_version={ad_manager.version}")
+            logger.info("[BW UPDATE] 광고문구 삭제 new_version=%d", ad_manager.version)
+            sent = await update.message.reply_text(
+                f"✅ 광고문구가 삭제되었습니다. (v{ad_manager.version})\n"
+                "이전 메시지 cleanup을 시작합니다..."
+            )
+            asyncio.create_task(cleanup_old_ads(context.bot))
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+            return
+
+        # /bw <문구> → 광고문구 설정
+        version = ad_manager.set_ad(args_text)
+        print(f"[BW UPDATE] 광고문구 변경 → new_version={version}")
+        logger.info("[BW UPDATE] 광고문구 변경 new_version=%d text=%r", version, args_text)
+        sent = await update.message.reply_text(
+            f"✅ 광고문구가 설정되었습니다. (v{version})\n\n"
+            f"{args_text}\n\n"
+            "이전 메시지 cleanup을 시작합니다..."
+        )
+        asyncio.create_task(cleanup_old_ads(context.bot))
         try:
             await update.message.delete()
         except Exception:
@@ -1558,9 +1585,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "(한국 주식: 1h/4h/12h 요청 시 일봉으로 대체)\n"
         "\n"
         "📣 광고문구 (관리자)\n"
-        "/setad 문구 → 광고문구 설정 (이전 메시지 자동 업데이트)\n"
-        "/setad → 현재 광고문구 확인\n"
-        "/clearad → 광고문구 삭제\n"
+        "/bw 문구 → 광고문구 설정 (이전 메시지 자동 업데이트)\n"
+        "/bw → 현재 광고문구 확인\n"
+        "/bw clear → 광고문구 삭제\n"
         "\n"
         "🔒 신규 입장자 인증\n"
         "새 멤버 입장 시 수학 문제 자동 출제 (10초 제한)\n"
@@ -1669,50 +1696,6 @@ async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
     await update.message.reply_text(text)
-
-
-# ═══════════════════════════════════════════════════
-# /setad · /clearad 명령어 (광고문구 관리, 관리자 전용)
-# ═══════════════════════════════════════════════════
-
-async def cmd_setad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/setad 문구 → 광고문구 설정. 인자 없으면 현재 문구 표시."""
-    if not update.message:
-        return
-    if not await check_is_admin(update, context):
-        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
-        return
-
-    if not context.args:
-        cur = ad_manager.get_ad()
-        if cur:
-            await update.message.reply_text(f"현재 광고문구 (v{ad_manager.version}):\n\n{cur}")
-        else:
-            await update.message.reply_text(
-                "현재 설정된 광고문구가 없습니다.\n사용법: /setad 광고문구"
-            )
-        return
-
-    new_text = ' '.join(context.args)
-    version  = ad_manager.set_ad(new_text)
-    await update.message.reply_text(
-        f"✅ 광고문구가 설정되었습니다. (v{version})\n\n{new_text}\n\n"
-        "이전 메시지 업데이트를 시작합니다..."
-    )
-    asyncio.create_task(cleanup_old_ads(context.bot))
-
-
-async def cmd_clearad(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/clearad → 광고문구 삭제."""
-    if not update.message:
-        return
-    if not await check_is_admin(update, context):
-        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
-        return
-
-    ad_manager.clear_ad()
-    await update.message.reply_text("✅ 광고문구가 삭제되었습니다.")
-    asyncio.create_task(cleanup_old_ads(context.bot))
 
 
 # ═══════════════════════════════════════════════════
@@ -1976,8 +1959,6 @@ def main() -> None:
     app.add_handler(CommandHandler('ak',        ak_chart))
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
-    app.add_handler(CommandHandler('setad',     cmd_setad))
-    app.add_handler(CommandHandler('clearad',   cmd_clearad))
 
     # InlineKeyboard 콜백 핸들러
     app.add_handler(
