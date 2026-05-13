@@ -541,6 +541,60 @@ def _load_krx_excel() -> list:
     return results
 
 
+def _load_kind_listing() -> list:
+    """
+    KRX KIND 공시시스템에서 전체 상장종목 수집 (단일 HTTP 요청, 로그인 불필요).
+    http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13
+    Naver 스크래핑이 실패/부족할 때 사용하는 fallback.
+    Returns [(ticker_6digit, name, market), ...]
+    """
+    try:
+        from io import StringIO
+        r = requests.get(
+            'http://kind.krx.co.kr/corpgeneral/corpList.do',
+            params={'method': 'download', 'searchType': '13'},
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'http://kind.krx.co.kr/',
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        r.encoding = 'euc-kr'
+        tables = pd.read_html(StringIO(r.text))
+        if not tables:
+            logger.warning("[KIND] no tables found")
+            return []
+        df = tables[0]
+        cols = {str(c).strip(): c for c in df.columns}
+        name_col = next((cols[c] for c in cols if '회사명' in c or '종목명' in c), None)
+        code_col = next((cols[c] for c in cols if '종목코드' in c or '코드' in c), None)
+        mkt_col  = next((cols[c] for c in cols if '시장구분' in c or '시장' in c), None)
+        if not name_col or not code_col:
+            logger.warning("[KIND] required columns not found: %s", list(df.columns))
+            return []
+        results = []
+        for _, row in df.iterrows():
+            raw_ticker = str(row[code_col]).strip().split('.')[0].zfill(6)
+            if not raw_ticker.isdigit() or len(raw_ticker) != 6:
+                continue
+            name = str(row[name_col]).strip()
+            if not name or name in ('nan', 'NaN'):
+                continue
+            market = 'KOSPI'
+            if mkt_col:
+                mkt_raw = str(row[mkt_col]).strip()
+                market = _MARKET_MAP.get(mkt_raw, _MARKET_MAP.get(mkt_raw[:2], 'KOSPI'))
+            results.append((raw_ticker, name, market))
+        k = sum(1 for _, _, m in results if m == 'KOSPI')
+        q = sum(1 for _, _, m in results if m == 'KOSDAQ')
+        print(f"[KIND LISTING] KOSPI={k} KOSDAQ={q} total={len(results)}")
+        return results
+    except Exception as e:
+        logger.warning("[KIND LISTING] failed: %s", e)
+        return []
+
+
 _NAVER_HEADERS = {
     'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept-Language': 'ko-KR,ko;q=0.9',
@@ -789,6 +843,7 @@ def _build_krx_cache() -> dict:
     """
     Build cache priority:
       1. Naver Finance KOSPI/KOSDAQ (live, paginated)  ← primary
+      1.5 KIND API (KRX 공시시스템, single request)    ← fallback when Naver<400/500
       2. Naver Finance ETF page      (live)            ← primary
       3. Static ETF list                               ← safety net
       4. KRX Excel 상장법인목록.xls                    ← fallback (<500 stocks)
@@ -807,6 +862,24 @@ def _build_krx_cache() -> dict:
         if nn not in by_norm:
             by_norm[nn] = ticker
 
+    # Debug targets — always check these in output
+    _DEBUG_STOCKS = {
+        '328130': '루닛',
+        '277810': '레인보우로보틱스',
+        '247540': '에코프로비엠',
+        '196170': '알테오젠',
+        '087010': '펩트론',
+        '403870': 'HPSP',
+    }
+
+    def _debug_check(stage: str) -> None:
+        for code, name in _DEBUG_STOCKS.items():
+            if code in by_ticker:
+                _, mkt = by_ticker[code]
+                print(f"[KRX DEBUG/{stage}] {name}({code}) ✓ market={mkt}")
+            else:
+                print(f"[KRX DEBUG/{stage}] {name}({code}) ✗ NOT loaded")
+
     # ── 1. Naver KOSPI + KOSDAQ ───────────────────────────────────────
     kospi_count = kosdaq_count = 0
     for ticker, name, market in _load_naver_market(0):
@@ -815,6 +888,27 @@ def _build_krx_cache() -> dict:
     for ticker, name, market in _load_naver_market(1):
         _add(ticker, name, market)
         kosdaq_count += 1
+
+    print(f"[KRX CACHE] Naver 로드: KOSPI={kospi_count} KOSDAQ={kosdaq_count}")
+    _debug_check('after_naver')
+
+    # ── 1.5. KIND fallback (Naver가 부족하면 KIND API로 보완) ──────────
+    konex_count = 0
+    if kospi_count < 400 or kosdaq_count < 500:
+        logger.warning(
+            "[KRX CACHE] Naver 부족 KOSPI=%d KOSDAQ=%d → KIND API fallback",
+            kospi_count, kosdaq_count,
+        )
+        kind_added_k = kind_added_q = 0
+        for ticker, name, market in _load_kind_listing():
+            before = len(entries)
+            _add(ticker, name, market)
+            if len(entries) > before:
+                if market == 'KOSPI':    kind_added_k += 1; kospi_count  += 1
+                elif market == 'KOSDAQ': kind_added_q += 1; kosdaq_count += 1
+                elif market == 'KONEX':  konex_count  += 1
+        print(f"[KIND] 추가: KOSPI+={kind_added_k} KOSDAQ+={kind_added_q}")
+        _debug_check('after_kind')
 
     # ── 2. Naver ETF page ─────────────────────────────────────────────
     etf_count = 0
@@ -831,11 +925,10 @@ def _build_krx_cache() -> dict:
         if len(entries) > before:
             etf_count += 1
 
-    # ── 4. KRX Excel fallback (Naver 수집 실패 시) ─────────────────────
-    konex_count = 0
+    # ── 4. KRX Excel fallback (KIND도 실패 시) ────────────────────────
     if kospi_count + kosdaq_count < 500:
         logger.warning(
-            "[KRX CACHE] Naver stocks %d+%d < 500 → Excel fallback",
+            "[KRX CACHE] KIND도 부족 %d+%d < 500 → Excel fallback",
             kospi_count, kosdaq_count,
         )
         for ticker, name, market in _load_krx_excel():
@@ -856,6 +949,7 @@ def _build_krx_cache() -> dict:
         f"KOSPI={kospi_count} KOSDAQ={kosdaq_count} "
         f"KONEX={konex_count} ETF={etf_count}"
     )
+    _debug_check('final')
     return {
         'by_norm':    by_norm,
         'by_ticker':  by_ticker,
@@ -1366,6 +1460,55 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
     plt.tight_layout(pad=0.5)
     fig.savefig(tmp_path, dpi=100, bbox_inches='tight', facecolor=BG_COLOR)
     plt.close(fig)
+
+
+# ── Korean exchange price fetchers ────────────────────────────────────
+
+def fetch_upbit_ticker(symbol: str) -> 'float | None':
+    """Upbit KRW 현재가. symbol='BTC' → market 'KRW-BTC'. Returns float or None."""
+    try:
+        market = f"KRW-{symbol.upper()}"
+        r = requests.get(
+            'https://api.upbit.com/v1/ticker',
+            params={'markets': market},
+            headers={'Accept': 'application/json'},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            logger.debug("[UPBIT] %s HTTP %d", market, r.status_code)
+            return None
+        data = r.json()
+        if not data:
+            return None
+        price = float(data[0]['trade_price'])
+        logger.info("[UPBIT] %s=₩%s", symbol, f"{int(price):,}")
+        return price
+    except Exception as e:
+        logger.debug("[UPBIT] %s error: %s", symbol, e)
+        return None
+
+
+def fetch_bithumb_ticker(symbol: str) -> 'float | None':
+    """Bithumb KRW 현재가. symbol='BTC' → BTC_KRW ticker. Returns float or None."""
+    try:
+        r = requests.get(
+            f'https://api.bithumb.com/public/ticker/{symbol.upper()}_KRW',
+            headers={'Accept': 'application/json'},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            logger.debug("[BITHUMB] %s HTTP %d", symbol, r.status_code)
+            return None
+        data = r.json()
+        if data.get('status') != '0000':
+            logger.debug("[BITHUMB] %s status=%s", symbol, data.get('status'))
+            return None
+        price = float(data['data']['closing_price'])
+        logger.info("[BITHUMB] %s=₩%s", symbol, f"{int(price):,}")
+        return price
+    except Exception as e:
+        logger.debug("[BITHUMB] %s error: %s", symbol, e)
+        return None
 
 
 # ── Public chart functions ─────────────────────────────────────────────

@@ -61,6 +61,8 @@ from chart_utils import (
     format_price,
     parse_timeframe,
     VALID_INTERVALS,
+    fetch_upbit_ticker,
+    fetch_bithumb_ticker,
 )
 
 # ═══════════════════════════════════════════════════
@@ -1243,7 +1245,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/ac 티커 [인터벌] → 코인 현물 캔들 차트 (Binance→Bybit)"""
+    """/ac 티커 [인터벌] → 코인 현물 캔들 차트 (Binance→Bybit) + Upbit/Bithumb 가격"""
     if not update.message:
         return
 
@@ -1269,14 +1271,39 @@ async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         timeframe = tf
 
+    # 코인 심볼 추출 (BTCUSDT → BTC, BTC/USDT → BTC)
+    coin = ticker.replace('USDT', '').replace('/', '').replace('USDT', '')
+
     processing_msg = await update.message.reply_text(f"차트 생성 중... {ticker} ({timeframe})")
 
-    result = await asyncio.to_thread(create_clean_candlestick_chart, ticker, timeframe)
+    # 차트 + 업비트 + 빗썸 병렬 요청
+    gathered = await asyncio.gather(
+        asyncio.to_thread(create_clean_candlestick_chart, ticker, timeframe),
+        asyncio.to_thread(fetch_upbit_ticker, coin),
+        asyncio.to_thread(fetch_bithumb_ticker, coin),
+        return_exceptions=True,
+    )
+    result        = gathered[0] if not isinstance(gathered[0], Exception) else {
+        'success': False, 'error': str(gathered[0]), 'caption': '',
+        'file_path': None, 'symbol': ticker, 'timeframe': timeframe,
+    }
+    upbit_price   = gathered[1] if isinstance(gathered[1], (int, float)) else None
+    bithumb_price = gathered[2] if isinstance(gathered[2], (int, float)) else None
 
     try:
         await processing_msg.delete()
     except Exception:
         pass
+
+    # 한국 거래소 가격을 caption에 추가
+    if isinstance(result, dict) and result.get('success'):
+        kr_lines = []
+        if upbit_price is not None:
+            kr_lines.append(f"🇰🇷 업비트: ₩{int(upbit_price):,}")
+        if bithumb_price is not None:
+            kr_lines.append(f"🇰🇷 빗썸:   ₩{int(bithumb_price):,}")
+        if kr_lines:
+            result['caption'] = (result.get('caption') or '') + '\n\n' + '\n'.join(kr_lines)
 
     await _send_chart_result(update, result)
 
