@@ -11,3 +11,4 @@ yfinance>=0.2.40
 pykrx>=1.0.45
 rapidfuzz>=3.0.0
 lxml>=4.0.0
+beautifulsoup4>=4.12.0

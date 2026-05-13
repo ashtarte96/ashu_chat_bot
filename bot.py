@@ -291,34 +291,102 @@ def _fetch_usdtkrw() -> float:
     raise ValueError("USDT/KRW 조회 실패")
 
 
-def _fetch_kospi_kosdaq() -> tuple:
-    """코스피·코스닥 현재가 (Naver Finance 스크래핑 → yfinance fallback)"""
+_NAVER_INDEX_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept-Language': 'ko-KR,ko;q=0.9',
+    'Referer': 'https://finance.naver.com/',
+}
+
+
+def _fetch_naver_index(code: str) -> tuple:
+    """
+    KOSPI 또는 KOSDAQ 현재 지수값 + 전일 대비 등락률(%) 반환.
+    (value: float, chg_pct: float | None)
+
+    전략:
+      1. Naver sise_index_day 페이지 → pd.read_html (등락률 컬럼 직접 파싱)
+      2. Naver mobile JSON API (m.stock.naver.com)
+      3. yfinance fallback (^KS11 / ^KQ11)
+    """
+    import re as _re
+    import pandas as _pd
+
+    # ── 1. sise_index_day page (pd.read_html) ─────────────────────────
     try:
-        import re as _re
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get('https://finance.naver.com/sise/', headers=headers, timeout=10)
+        url = f'https://finance.naver.com/sise/sise_index_day.naver?code={code}'
+        r = requests.get(url, headers=_NAVER_INDEX_HEADERS, timeout=10)
+        r.encoding = 'euc-kr'
+        tables = _pd.read_html(r.text)
+        for tbl in tables:
+            str_cols = [str(c) for c in tbl.columns]
+            val_idx  = next((i for i, c in enumerate(str_cols) if '체결가' in c or '종가' in c), None)
+            chg_idx  = next((i for i, c in enumerate(str_cols) if '등락률' in c), None)
+            if val_idx is None:
+                continue
+            df_valid = tbl.dropna(subset=[tbl.columns[val_idx]])
+            if df_valid.empty:
+                continue
+            row     = df_valid.iloc[0]
+            val_str = str(row.iloc[val_idx]).replace(',', '')
+            val     = float(_re.sub(r'[^\d.]', '', val_str))
+            if val <= 10:
+                continue
+            chg_pct = None
+            if chg_idx is not None:
+                chg_str = str(row.iloc[chg_idx])
+                m = _re.search(r'([+\-]?\d+\.?\d*)', chg_str)
+                if m:
+                    chg_pct = float(m.group(1))
+            logger.info("[NAVER %s] read_html: val=%.2f chg=%s", code, val, chg_pct)
+            return val, chg_pct
+    except Exception as e:
+        logger.debug("[NAVER %s] read_html failed: %s", code, e)
+
+    # ── 2. Naver mobile JSON API ───────────────────────────────────────
+    try:
+        r = requests.get(
+            f'https://m.stock.naver.com/api/index/{code}/basic',
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=8,
+        )
         if r.status_code == 200:
-            html = r.text
-            kospi_m  = _re.search(r'KOSPI.*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)', html, _re.S)
-            kosdaq_m = _re.search(r'KOSDAQ.*?([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?)', html, _re.S)
-            if kospi_m and kosdaq_m:
-                kospi  = float(kospi_m.group(1).replace(',', ''))
-                kosdaq = float(kosdaq_m.group(1).replace(',', ''))
-                if kospi > 100 and kosdaq > 100:
-                    return kospi, kosdaq
-    except Exception:
-        pass
-    # yfinance fallback
+            d = r.json()
+            val_raw   = str(d.get('closePrice') or d.get('currentValue') or '0').replace(',', '')
+            val       = float(_re.sub(r'[^\d.]', '', val_raw) or '0')
+            ratio_raw = str(d.get('fluctuationsRatio') or d.get('fluctuationRatio') or '0')
+            ratio     = float(_re.sub(r'[^\d.]', '', ratio_raw) or '0')
+            ftype     = str(d.get('fluctuationType') or '').upper()
+            if 'FALL' in ftype or 'DOWN' in ftype:
+                ratio = -abs(ratio)
+            if val > 10:
+                logger.info("[NAVER %s] JSON: val=%.2f chg=%.2f%%", code, val, ratio)
+                return val, ratio
+    except Exception as e:
+        logger.debug("[NAVER %s] JSON failed: %s", code, e)
+
+    # ── 3. yfinance fallback ───────────────────────────────────────────
     import yfinance as yf
-    kospi  = float(yf.Ticker('^KS11').fast_info['last_price'])
-    kosdaq = float(yf.Ticker('^KQ11').fast_info['last_price'])
-    return kospi, kosdaq
+    _map = {'KOSPI': '^KS11', 'KOSDAQ': '^KQ11'}
+    fi   = yf.Ticker(_map.get(code, '^KS11')).fast_info
+    val  = float(fi['last_price'])
+    prev = float(fi.get('previous_close') or val)
+    chg  = (val / prev - 1) * 100 if prev else 0.0
+    logger.info("[NAVER %s] yfinance: val=%.2f chg=%.2f%%", code, val, chg)
+    return val, chg
 
 
-def _fetch_nasdaq() -> float:
-    """나스닥 종합지수 (yfinance ^IXIC)"""
+def _fetch_us_index(ticker: str, label: str) -> tuple:
+    """
+    미국 지수 (^IXIC 나스닥 / ^GSPC S&P500) 현재가 + 전일 대비 등락률(%) 반환.
+    (value: float, chg_pct: float)
+    """
     import yfinance as yf
-    return float(yf.Ticker('^IXIC').fast_info['last_price'])
+    fi   = yf.Ticker(ticker).fast_info
+    val  = float(fi['last_price'])
+    prev = float(fi.get('previous_close') or val)
+    chg  = (val / prev - 1) * 100 if prev else 0.0
+    logger.info("[%s] %s: val=%.2f chg=%.2f%%", ticker, label, val, chg)
+    return val, chg
 
 
 def _fetch_btc_dominance() -> float:
@@ -1479,7 +1547,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/kp → 김프 & 주요지수 (USD/KRW, USDT/KRW, 코스피, 코스닥, 나스닥, BTC 도미넌스, 공포탐욕)"""
+    """/kp → 김프 & 주요지수 (코스피/코스닥/나스닥/S&P500 등락률 포함)"""
     if not update.message:
         return
 
@@ -1493,49 +1561,71 @@ async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         results = await asyncio.gather(
             asyncio.to_thread(_fetch_usdkrw),
             asyncio.to_thread(_fetch_usdtkrw),
-            asyncio.to_thread(_fetch_kospi_kosdaq),
-            asyncio.to_thread(_fetch_nasdaq),
+            asyncio.to_thread(_fetch_naver_index, 'KOSPI'),
+            asyncio.to_thread(_fetch_naver_index, 'KOSDAQ'),
+            asyncio.to_thread(_fetch_us_index, '^IXIC', '나스닥'),
+            asyncio.to_thread(_fetch_us_index, '^GSPC', 'S&P500'),
             asyncio.to_thread(_fetch_btc_dominance),
             asyncio.to_thread(_fetch_fear_greed),
             return_exceptions=True,
         )
-        usdkrw_r, usdtkrw_r, kospi_kosdaq_r, nasdaq_r, btc_dom_r, fg_r = results
+        (usdkrw_r, usdtkrw_r,
+         kospi_r, kosdaq_r,
+         nasdaq_r, sp500_r,
+         btc_dom_r, fg_r) = results
 
-        usdkrw  = float(usdkrw_r)  if not isinstance(usdkrw_r,  Exception) else None
-        usdtkrw = float(usdtkrw_r) if not isinstance(usdtkrw_r, Exception) else None
+        def _unpack_float(r):
+            return float(r) if not isinstance(r, Exception) else None
 
-        if usdkrw and usdtkrw:
-            kp = (usdtkrw / usdkrw - 1) * 100
-        else:
-            kp = None
+        def _unpack_pair(r):
+            return r if not isinstance(r, Exception) else (None, None)
 
-        kospi, kosdaq = (kospi_kosdaq_r if not isinstance(kospi_kosdaq_r, Exception)
-                         else (None, None))
-        nasdaq   = (float(nasdaq_r)  if not isinstance(nasdaq_r,  Exception) else None)
-        btc_dom  = (float(btc_dom_r) if not isinstance(btc_dom_r, Exception) else None)
-        fear_value, fear_class = (fg_r if not isinstance(fg_r, Exception) else (None, None))
+        usdkrw  = _unpack_float(usdkrw_r)
+        usdtkrw = _unpack_float(usdtkrw_r)
+        kp      = (usdtkrw / usdkrw - 1) * 100 if usdkrw and usdtkrw else None
 
-        def _fmt_float(v, fmt):
+        kospi_val,  kospi_chg  = _unpack_pair(kospi_r)
+        kosdaq_val, kosdaq_chg = _unpack_pair(kosdaq_r)
+        nasdaq_val, nasdaq_chg = _unpack_pair(nasdaq_r)
+        sp500_val,  sp500_chg  = _unpack_pair(sp500_r)
+        btc_dom                = _unpack_float(btc_dom_r)
+        fear_value, fear_class = _unpack_pair(fg_r)
+
+        def _fv(v, fmt):
             return format(v, fmt) if v is not None else 'N/A'
+
+        def _idx(val, chg):
+            if val is None:
+                return 'N/A'
+            s = f"{val:,.2f}"
+            if chg is not None:
+                s += f" ({'+' if chg >= 0 else ''}{chg:.2f}%)"
+            return s
+
+        btc_str  = f"{btc_dom:.2f}%" if btc_dom is not None else 'N/A'
+        fear_str = f"{fear_value} ({fear_class})" if fear_value else 'N/A'
 
         message = (
             f"김프 & 주요지수\n\n"
-            f"💵 USD/KRW: {_fmt_float(usdkrw, ',.2f')}\n"
-            f"🪙 USDT/KRW: {_fmt_float(usdtkrw, ',.2f')}\n\n"
+            f"💵 USD/KRW: {_fv(usdkrw, ',.2f')}\n"
+            f"🪙 USDT/KRW: {_fv(usdtkrw, ',.2f')}\n\n"
             f"🇰🇷 김프: {(f'{kp:+.2f}%') if kp is not None else 'N/A'}\n\n"
-            f"🇰🇷 코스피: {_fmt_float(kospi, ',.2f')}\n"
-            f"🇰🇷 코스닥: {_fmt_float(kosdaq, ',.2f')}\n"
-            f"🇺🇸 나스닥: {_fmt_float(nasdaq, ',.2f')}\n\n"
-            f"👑 BTC 도미넌스: {_fmt_float(btc_dom, '.2f')}{'%' if btc_dom is not None else ''}\n"
-            f"😱 공포탐욕지수: {fear_value if fear_value else 'N/A'}"
-            f"{(' (' + fear_class + ')') if fear_class else ''}"
+            f"🇰🇷 코스피: {_idx(kospi_val, kospi_chg)}\n"
+            f"🇰🇷 코스닥: {_idx(kosdaq_val, kosdaq_chg)}\n"
+            f"🇺🇸 나스닥: {_idx(nasdaq_val, nasdaq_chg)}\n"
+            f"🇺🇸 S&P500: {_idx(sp500_val, sp500_chg)}\n\n"
+            f"👑 BTC 도미넌스: {btc_str}\n"
+            f"😱 공포탐욕지수: {fear_str}"
         )
 
         logger.info(
-            "[KP] usdkrw=%.2f usdtkrw=%.2f kp=%s kospi=%s kosdaq=%s nasdaq=%s btc_dom=%s fg=%s/%s",
-            usdkrw or 0, usdtkrw or 0,
+            "[KP] usdkrw=%s usdtkrw=%s kp=%s "
+            "kospi=%s/%s kosdaq=%s/%s nasdaq=%s/%s sp500=%s/%s btc=%s fg=%s",
+            usdkrw, usdtkrw,
             f"{kp:.2f}" if kp is not None else "N/A",
-            kospi, kosdaq, nasdaq, btc_dom, fear_value, fear_class,
+            kospi_val, kospi_chg, kosdaq_val, kosdaq_chg,
+            nasdaq_val, nasdaq_chg, sp500_val, sp500_chg,
+            btc_dom, fear_value,
         )
         _KP_CACHE['text'] = message
         _KP_CACHE['ts']   = now
