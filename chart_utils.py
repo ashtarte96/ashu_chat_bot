@@ -1270,7 +1270,7 @@ def fetch_kr_stock_ohlcv(ticker: str, timeframe: str) -> pd.DataFrame:
 
 def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     """
-    KRX candlestick chart using pykrx (no yfinance).
+    KRX candlestick chart using pykrx (OHLCV) + KIS API (현재가/등락/거래량).
 
     1d / 1w / 1y : full support
     1h / 4h / 12h: pykrx has no intraday data → returns daily candles with a note
@@ -1297,8 +1297,31 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     if df.empty:
         raise ValueError(f"차트 데이터 없음: {bare}")
 
-    current_price = float(df['close'].iloc[-1])
-    prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+    # ── 현재가: KIS API 우선, 실패 시 pykrx 마지막 종가 ──────────────
+    kis = fetch_kis_stock_price(bare)
+    if kis and kis['price'] > 0:
+        current_price = float(kis['price'])
+        change_pct    = kis['change_pct']
+        change_amt    = kis['change']
+        volume        = kis['volume']
+        price_source  = 'KIS'
+        print(f"[KR CHART] KIS 현재가: ₩{current_price:,.0f} ({change_pct:+.2f}%)")
+    else:
+        current_price = float(df['close'].iloc[-1])
+        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        change_amt    = int(round(current_price - prev_price))
+        change_pct    = (current_price / prev_price - 1) * 100 if prev_price else 0.0
+        last_row      = df_raw.tail(1)
+        volume        = int(last_row['volume'].iloc[0]) if 'volume' in df_raw.columns and not last_row.empty else 0
+        price_source  = 'pykrx'
+        print(f"[KR CHART] pykrx 마지막 종가: ₩{current_price:,.0f} (KIS API 미설정)")
+
+    # 시장 정보 캐시에서 조회
+    try:
+        cache  = _get_krx_cache()
+        _, market = cache['by_ticker'].get(bare, (name, ''))
+    except Exception:
+        market = ''
 
     tf_label = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
 
@@ -1309,18 +1332,30 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
         title_tf   = tf_label
         caption_tf = tf_label
 
+    # 등락률 부호 기호
+    sign_emoji = '📈' if change_pct >= 0 else '📉'
+    pct_str    = f"{change_pct:+.2f}%"
+    amt_sign   = '+' if change_amt >= 0 else ''
+    amt_str    = f"{amt_sign}{change_amt:,}"
+
     title    = f"{name} ({bare}) - {title_tf} - KRX"
     tmp_path = _make_tmp_path()
     _draw_chart(df, title, effective_tf, tmp_path)
 
-    caption = (
-        f"📊 {name} ({bare}) 차트\n"
-        f"🕒 Timeframe: {caption_tf}\n\n"
-        f"현재가: {_fmt_kr(current_price)} KRW\n"
-        f"전일대비: {_change_line(current_price, prev_price, _fmt_kr)}\n"
-        f"52주 최고가: {_fmt_kr(high_52w)} KRW\n"
-        f"52주 최저가: {_fmt_kr(low_52w)} KRW"
-    )
+    lines = [
+        f"{sign_emoji} {name} ({bare}) 차트",
+        f"🕒 Timeframe: {caption_tf}\n",
+        f"💰 현재가: ₩{int(current_price):,}",
+        f"📊 등락률: {pct_str} ({amt_str}원)",
+    ]
+    if volume > 0:
+        lines.append(f"📦 거래량: {volume:,}")
+    lines.append(f"\n52주 최고: ₩{int(high_52w):,}")
+    lines.append(f"52주 최저: ₩{int(low_52w):,}")
+    if market:
+        lines.append(f"\n🏢 시장: {market}")
+
+    caption = '\n'.join(lines)
     return tmp_path, caption
 
 
@@ -1460,6 +1495,154 @@ def _draw_chart(df: pd.DataFrame, title: str, timeframe: str, tmp_path: str) -> 
     plt.tight_layout(pad=0.5)
     fig.savefig(tmp_path, dpi=100, bbox_inches='tight', facecolor=BG_COLOR)
     plt.close(fig)
+
+
+# ── 한국투자증권 OpenAPI ───────────────────────────────────────────────
+
+_KIS_TOKEN_CACHE: dict = {'token': None, 'expires_at': 0.0}
+_KIS_BASE = 'https://openapi.koreainvestment.com:9443'
+
+
+def get_kis_access_token() -> 'str | None':
+    """
+    한국투자증권 OpenAPI OAuth2 access token 발급 (24h 캐시).
+    환경변수 KIS_APP_KEY / KIS_APP_SECRET 필요.
+    없으면 None 반환 (graceful fallback).
+    """
+    import time
+    global _KIS_TOKEN_CACHE
+
+    app_key    = os.getenv('KIS_APP_KEY', '').strip()
+    app_secret = os.getenv('KIS_APP_SECRET', '').strip()
+    if not app_key or not app_secret:
+        logger.debug("[KIS TOKEN] KIS_APP_KEY/KIS_APP_SECRET 미설정 → pykrx fallback")
+        return None
+
+    # 유효한 토큰 재사용
+    if _KIS_TOKEN_CACHE['token'] and time.time() < _KIS_TOKEN_CACHE['expires_at']:
+        return _KIS_TOKEN_CACHE['token']
+
+    try:
+        r = requests.post(
+            f'{_KIS_BASE}/oauth2/tokenP',
+            json={
+                'grant_type': 'client_credentials',
+                'appkey':     app_key,
+                'appsecret':  app_secret,
+            },
+            headers={'Content-Type': 'application/json'},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            logger.error("[KIS TOKEN] HTTP %d: %s", r.status_code, r.text[:200])
+            return None
+        data = r.json()
+        token = data.get('access_token')
+        if not token:
+            logger.error("[KIS TOKEN] access_token 없음: %s", data)
+            return None
+        expires_in = int(data.get('expires_in', 86400))
+        _KIS_TOKEN_CACHE['token']      = token
+        _KIS_TOKEN_CACHE['expires_at'] = time.time() + expires_in - 600  # 10분 여유
+        logger.info("[KIS TOKEN] 발급 성공 (expires_in=%ds)", expires_in)
+        print(f"[KIS TOKEN] 발급 성공")
+        return token
+    except Exception as e:
+        logger.error("[KIS TOKEN] 발급 실패: %s", e)
+        return None
+
+
+def fetch_kis_stock_price(code: str) -> 'dict | None':
+    """
+    한국투자증권 OpenAPI 현재가 조회 (TR_ID: FHKST01010100).
+    code: 6자리 종목코드 (예: '328130')
+
+    Returns:
+        {
+          'price': int,         # 현재가
+          'change': int,        # 전일대비 금액
+          'change_pct': float,  # 등락률 (%)
+          'volume': int,        # 누적거래량
+          'open': int,          # 시가
+          'high': int,          # 고가
+          'low': int,           # 저가
+        }
+    or None if API unavailable or failed.
+    """
+    token = get_kis_access_token()
+    if not token:
+        return None
+
+    app_key    = os.getenv('KIS_APP_KEY', '').strip()
+    app_secret = os.getenv('KIS_APP_SECRET', '').strip()
+
+    try:
+        r = requests.get(
+            f'{_KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-price',
+            headers={
+                'authorization': f'Bearer {token}',
+                'appkey':        app_key,
+                'appsecret':     app_secret,
+                'tr_id':         'FHKST01010100',
+                'custtype':      'P',
+                'Content-Type':  'application/json; charset=utf-8',
+            },
+            params={
+                'FID_COND_MRKT_DIV_CODE': 'J',
+                'FID_INPUT_ISCD':         code,
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            logger.error("[KIS PRICE] %s HTTP %d: %s", code, r.status_code, r.text[:200])
+            return None
+        j = r.json()
+        if j.get('rt_cd') != '0':
+            logger.error("[KIS PRICE] %s rt_cd=%s msg=%s", code, j.get('rt_cd'), j.get('msg1'))
+            return None
+
+        out = j.get('output', {})
+
+        def _int(key: str) -> int:
+            try:
+                return int(out.get(key) or 0)
+            except (ValueError, TypeError):
+                return 0
+
+        def _float(key: str) -> float:
+            try:
+                return float(out.get(key) or 0.0)
+            except (ValueError, TypeError):
+                return 0.0
+
+        price      = _int('stck_prpr')
+        change     = _int('prdy_vrss')
+        change_pct = _float('prdy_ctrt')
+        volume     = _int('acml_vol')
+        open_p     = _int('stck_oprc')
+        high_p     = _int('stck_hgpr')
+        low_p      = _int('stck_lwpr')
+
+        # sign 보정: prdy_vrss_sign 4/5 = 하락
+        sign = out.get('prdy_vrss_sign', '3')
+        if sign in ('4', '5'):
+            change     = -abs(change)
+            change_pct = -abs(change_pct)
+
+        logger.info("[KIS PRICE] code=%s price=%s change_pct=%s%%", code, price, change_pct)
+        print(f"[KIS PRICE] code={code} price={price:,} change_pct={change_pct:+.2f}%")
+        return {
+            'price':      price,
+            'change':     change,
+            'change_pct': change_pct,
+            'volume':     volume,
+            'open':       open_p,
+            'high':       high_p,
+            'low':        low_p,
+        }
+    except Exception as e:
+        logger.error("[KIS PRICE] %s 조회 실패: %s", code, e)
+        return None
 
 
 # ── Korean exchange price fetchers ────────────────────────────────────

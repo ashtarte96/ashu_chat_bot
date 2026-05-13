@@ -63,6 +63,8 @@ from chart_utils import (
     VALID_INTERVALS,
     fetch_upbit_ticker,
     fetch_bithumb_ticker,
+    get_kis_access_token,
+    fetch_kis_stock_price,
 )
 
 # ═══════════════════════════════════════════════════
