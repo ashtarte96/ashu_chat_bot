@@ -584,49 +584,124 @@ def _fetch_naver_etf_list() -> list:
         return []
 
 
-def _load_naver_market(sosok: int, max_pages: int = 50) -> list:
+def _parse_market_soup(soup, market: str, results: list, seen: set) -> int:
     """
-    Naver Finance sise_market_sum 에서 코스피(sosok=0)/코스닥(sosok=1) 전체 종목 수집.
-    각 페이지에서 종목코드+종목명 추출. 빈 페이지면 중단.
+    Naver sise_market_sum 페이지 soup에서 종목코드+이름 추출.
+    반환: 이번 페이지에서 신규 추가된 종목 수.
+
+    전략 1: table.type_2 a[href*="code="]  (테이블 범위 내 종목 링크)
+    전략 2: a[href*="item/main.naver?code="]  (전체 페이지 fallback)
+    """
+    added = 0
+
+    links = soup.select('table.type_2 a[href*="code="]')
+    if not links:
+        links = soup.select('a[href*="item/main.naver?code="]')
+
+    for a in links:
+        href = a.get('href', '')
+        m = re.search(r'code=(\d{6})', href)
+        if not m:
+            continue
+        ticker = m.group(1)
+        name   = a.get_text(strip=True)
+        if ticker and name and ticker not in seen:
+            results.append((ticker, name, market))
+            seen.add(ticker)
+            added += 1
+    return added
+
+
+def _detect_last_page(soup) -> int:
+    """
+    Naver Finance 페이지네이션에서 마지막 페이지 번호 탐지.
+    .pgRR → 맨뒤 링크의 page=N 파라미터 추출.
+    """
+    # 여러 selector 시도 (Naver 레이아웃 버전 차이 대응)
+    for sel in ['td.pgRR a', '.pgRR a', 'a.pgRR']:
+        tag = soup.select_one(sel)
+        if tag:
+            href = tag.get('href', '')
+            m = re.search(r'page=(\d+)', href)
+            if m:
+                return int(m.group(1))
+
+    # fallback: 페이지 링크 전체에서 최댓값
+    max_p = 1
+    for a in soup.select('div.paging a, .paging a, td[class*="pg"] a'):
+        href = a.get('href', '')
+        m = re.search(r'page=(\d+)', href)
+        if m:
+            max_p = max(max_p, int(m.group(1)))
+    return max_p if max_p > 1 else 50
+
+
+def _load_naver_market(sosok: int) -> list:
+    """
+    Naver Finance sise_market_sum에서 KOSPI(sosok=0)/KOSDAQ(sosok=1) 전체 종목 수집.
+
+    알고리즘:
+      1) 첫 페이지 로드 → pgRR로 마지막 페이지 번호 탐지
+      2) 2 ~ last_page 전 페이지 순회 (중간 오류가 있어도 건너뜀)
+      3) 각 페이지에서 종목코드+이름 추출
+
     Returns [(ticker_6digit, name, market), ...]
     """
+    import time as _time
     from bs4 import BeautifulSoup
-    market = 'KOSPI' if sosok == 0 else 'KOSDAQ'
-    results = []
-    seen: set = set()
 
-    for page in range(1, max_pages + 1):
-        url = (
-            'https://finance.naver.com/sise/sise_market_sum.naver'
-            f'?sosok={sosok}&page={page}'
-        )
+    market    = 'KOSPI' if sosok == 0 else 'KOSDAQ'
+    base_url  = (
+        'https://finance.naver.com/sise/sise_market_sum.naver'
+        f'?sosok={sosok}'
+    )
+    results:  list = []
+    seen:     set  = set()
+    last_page = 50  # default safety limit
+
+    # ── 1. 첫 페이지 + 마지막 페이지 탐지 ────────────────────────────
+    try:
+        r = requests.get(f'{base_url}&page=1', headers=_NAVER_HEADERS, timeout=15)
+        r.encoding = 'euc-kr'
+        soup = BeautifulSoup(r.text, 'lxml')
+        last_page = _detect_last_page(soup)
+        cnt = _parse_market_soup(soup, market, results, seen)
+        print(f"[{market} LOAD] 마지막 페이지={last_page}  page=1: {cnt}개")
+    except Exception as e:
+        logger.error("[%s] page=1 failed: %s", market, e)
+        return results
+
+    # ── 2. 2 ~ last_page 전 페이지 순회 ──────────────────────────────
+    consecutive_empty = 0
+    for page in range(2, last_page + 1):
+        _time.sleep(0.15)   # Naver 서버 부하 방지
         try:
-            r = requests.get(url, headers=_NAVER_HEADERS, timeout=15)
+            r = requests.get(
+                f'{base_url}&page={page}', headers=_NAVER_HEADERS, timeout=15)
             r.encoding = 'euc-kr'
             soup = BeautifulSoup(r.text, 'lxml')
+            cnt = _parse_market_soup(soup, market, results, seen)
 
-            page_count = 0
-            for a in soup.select('table.type_2 td.name a'):
-                href = a.get('href', '')
-                m = re.search(r'code=(\d{6})', href)
-                if not m:
-                    continue
-                ticker = m.group(1)
-                name   = a.get_text(strip=True)
-                if ticker and name and ticker not in seen:
-                    results.append((ticker, name, market))
-                    seen.add(ticker)
-                    page_count += 1
+            if cnt == 0:
+                consecutive_empty += 1
+                logger.debug("[%s] page=%d: 0개 (연속 빈 페이지=%d)",
+                             market, page, consecutive_empty)
+                # 3페이지 연속 빈 경우만 중단 (일시적 파싱 실패 대비)
+                if consecutive_empty >= 3:
+                    print(f"[{market} LOAD] 3페이지 연속 빈 페이지 → 종료 (page={page})")
+                    break
+            else:
+                consecutive_empty = 0
 
-            if page_count == 0:
-                break  # 빈 페이지 → 마지막 페이지 지남
+            if page % 10 == 0:
+                print(f"[{market} LOAD] page={page}/{last_page} 누적={len(results)}")
 
         except Exception as e:
-            logger.warning("[NAVER %s] page=%d error: %s", market, page, e)
-            if page <= 2:
-                break  # 첫 페이지부터 실패 → 중단
+            logger.warning("[%s] page=%d error (skip): %s", market, page, e)
 
     print(f"[NAVER STOCK LOAD] {market} count={len(results)}")
+    if results:
+        print(f"[{market} LOAD] 샘플 5개: {[(t,n) for t,n,_ in results[:5]]}")
     return results
 
 
