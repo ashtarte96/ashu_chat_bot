@@ -716,66 +716,130 @@ def find_kr_stock(query: str):
     return None, []
 
 
-def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
+def is_kr_ticker(ticker: str) -> bool:
+    """True when ticker is a KRX stock: bare 6-digit code or 6-digit.KS / .KQ"""
+    bare = ticker.split('.')[0]
+    return bare.isdigit() and len(bare) == 6
+
+
+def _bare_kr_ticker(ticker: str) -> str:
+    """Strip .KS / .KQ suffix → bare 6-digit pykrx code."""
+    return ticker.split('.')[0]
+
+
+def fetch_kr_stock_ohlcv(ticker: str, timeframe: str) -> pd.DataFrame:
     """
-    KRX candlestick chart.
-    Supported: 1d / 1w / 1y  (pykrx has no intraday data)
-    Returns (file_path, caption) or raises.
+    Fetch KRX OHLCV using pykrx — works for KOSPI, KOSDAQ, KONEX, and ETFs.
+
+    Always fetches raw daily data; resampling is done by the caller.
+    Days fetched per timeframe:
+      1h / 4h / 12h / 1d → 365 days  (intraday not available; caller shows daily)
+      1w                  → 730 days  (~100 weekly candles)
+      1y                  → 1825 days (~5 years for monthly resampling)
+
+    Returns DataFrame with lowercase columns (open/high/low/close/volume),
+    DatetimeIndex localized to UTC.
     """
-    if timeframe not in ('1d', '1w', '1y'):
-        raise ValueError(
-            f"한국 주식은 1d / 1w / 1y 인터벌만 지원합니다.\n"
-            f"입력값: {timeframe}"
-        )
     try:
         from pykrx import stock as krx
     except ImportError:
-        raise ImportError("pykrx 패키지가 설치되지 않았습니다: pip install pykrx")
+        raise ImportError("pykrx 패키지가 필요합니다: pip install pykrx")
 
-    if timeframe == '1d':
-        days_back = 90      # ~60 trading days
-    elif timeframe == '1w':
-        days_back = 700     # ~100 weeks, take last 60
-    else:                   # 1y
-        days_back = 1825    # ~5 years daily, resample monthly → last 60
+    bare = _bare_kr_ticker(ticker)
 
-    todate   = date.today().strftime("%Y%m%d")
-    fromdate = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
+    _DAYS_BACK = {
+        '1h': 365, '4h': 365, '12h': 365, '1d': 365,
+        '1w': 730, '1y': 1825,
+    }
+    days_back = _DAYS_BACK.get(timeframe, 365)
+    todate    = date.today().strftime('%Y%m%d')
+    fromdate  = (date.today() - timedelta(days=days_back)).strftime('%Y%m%d')
 
-    df = krx.get_market_ohlcv_by_date(fromdate, todate, ticker)
+    print(f"[KR FETCH] ticker={bare} tf={timeframe} from={fromdate} to={todate}")
+
+    df = krx.get_market_ohlcv_by_date(fromdate, todate, bare)
+
+    # ETF fallback: try get_etf_ohlcv_by_date when market API returns empty
     if df is None or df.empty:
-        raise ValueError(f"데이터를 가져올 수 없습니다: {ticker}")
+        print(f"[KR FETCH] market API empty for {bare}, trying ETF API")
+        try:
+            df = krx.get_etf_ohlcv_by_date(fromdate, todate, bare)
+        except Exception as e:
+            logger.warning("[KR FETCH] ETF API failed for %s: %s", bare, e)
+
+    if df is None or df.empty:
+        raise ValueError(f"pykrx 데이터 없음: {bare}. 상장 종목인지 확인하세요.")
 
     df = df.rename(columns={
         '시가': 'open', '고가': 'high', '저가': 'low',
         '종가': 'close', '거래량': 'volume',
     })
-    df = df[['open', 'high', 'low', 'close', 'volume']]
+    keep = [c for c in ['open', 'high', 'low', 'close', 'volume'] if c in df.columns]
+    df = df[keep].copy()
+    if 'volume' not in df.columns:
+        df['volume'] = 0
 
+    df.index = pd.to_datetime(df.index)
     if df.index.tz is None:
-        df.index = pd.to_datetime(df.index).tz_localize('Asia/Seoul').tz_convert('UTC')
+        df.index = df.index.tz_localize('Asia/Seoul').tz_convert('UTC')
 
-    # Keep raw daily data for 52w stats before resampling
-    df_raw = df.copy()
+    df = df.dropna(subset=['open', 'high', 'low', 'close'])
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df = df.dropna(subset=['open', 'close'])
 
-    if timeframe == '1w':
-        df = _resample_ohlcv(df, 'W').tail(60)
-    elif timeframe == '1y':
-        df = _to_monthly(df)
+    print(f"[KR FETCH OK] {bare} tf={timeframe} rows={len(df)}")
+    return df
+
+
+def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
+    """
+    KRX candlestick chart using pykrx (no yfinance).
+
+    1d / 1w / 1y : full support
+    1h / 4h / 12h: pykrx has no intraday data → returns daily candles with a note
+
+    Returns (file_path, caption) or raises.
+    """
+    bare = _bare_kr_ticker(ticker)
+    intraday_fallback = timeframe in ('1h', '4h', '12h')
+    effective_tf = '1d' if intraday_fallback else timeframe
+
+    df_raw = fetch_kr_stock_ohlcv(bare, effective_tf)
+
+    # 52w stats always derived from the raw (daily) data
+    high_52w = float(df_raw.tail(252)['high'].max())
+    low_52w  = float(df_raw.tail(252)['low'].min())
+
+    if effective_tf == '1w':
+        df = _resample_ohlcv(df_raw, 'W').tail(60)
+    elif effective_tf == '1y':
+        df = _to_monthly(df_raw)
+    else:
+        df = df_raw.tail(60)
+
+    if df.empty:
+        raise ValueError(f"차트 데이터 없음: {bare}")
 
     current_price = float(df['close'].iloc[-1])
     prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
-    high_52w      = float(df_raw.tail(252)['high'].max())
-    low_52w       = float(df_raw.tail(252)['low'].min())
 
-    label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
-    title    = f"{name} ({ticker}) - {label} - KRX"
+    tf_label = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+
+    if intraday_fallback:
+        title_tf   = f"1D (요청: {tf_label})"
+        caption_tf = f"1D ⚠️ (한국주식은 {tf_label} 미지원 → 일봉 표시)"
+    else:
+        title_tf   = tf_label
+        caption_tf = tf_label
+
+    title    = f"{name} ({bare}) - {title_tf} - KRX"
     tmp_path = _make_tmp_path()
-    _draw_chart(df, title, timeframe, tmp_path)
+    _draw_chart(df, title, effective_tf, tmp_path)
 
     caption = (
-        f"📊 {name} ({ticker}) 차트\n"
-        f"🕒 Timeframe: {label}\n\n"
+        f"📊 {name} ({bare}) 차트\n"
+        f"🕒 Timeframe: {caption_tf}\n\n"
         f"현재가: {_fmt_kr(current_price)} KRW\n"
         f"전일대비: {_change_line(current_price, prev_price, _fmt_kr)}\n"
         f"52주 최고가: {_fmt_kr(high_52w)} KRW\n"

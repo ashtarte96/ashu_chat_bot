@@ -987,18 +987,18 @@ async def cmd_ap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /ak 종목코드        → 한국 주식 일봉 차트
-    /ak 종목명          → 종목명으로 검색 (하드코딩 매핑 우선)
-    예: /ak 005930  /  /ak 삼성전자  /  /ak SK하이닉스
+    /ak 종목명 [인터벌]  → 한국 주식 차트 (pykrx 기반)
+    예: /ak 삼성전자  /  /ak 005930  /  /ak 한국전력 1w
     """
     if not update.message:
         return
 
     if not context.args:
         await update.message.reply_text(
-            "형식: /ak 종목코드 또는 종목명 [인터벌]\n"
-            "예시: /ak 삼성전자  /  /ak 005930  /  /ak 삼성전자 1w\n"
-            "지원 인터벌: 1d / 1w / 1y  (기본: 1d)"
+            "형식: /ak 종목명 또는 종목코드 [인터벌]\n"
+            "예시: /ak 삼성전자  /  /ak 005930  /  /ak 한국전력 1w\n"
+            "지원 인터벌: 1d / 1w / 1y  (기본: 1d)\n"
+            "※ 1h / 4h / 12h 입력 시 일봉으로 대체 표시"
         )
         return
 
@@ -1007,14 +1007,7 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # 마지막 인자가 인터벌이면 분리
         if args[-1].lower() in VALID_INTERVALS:
-            tf = parse_timeframe(args[-1])
-            if tf in ('1h', '4h', '12h'):
-                await update.message.reply_text(
-                    "한국 주식은 1h / 4h / 12h 인터벌을 지원하지 않습니다.\n"
-                    "지원 인터벌: 1d / 1w / 1y"
-                )
-                return
-            timeframe = tf or '1d'
+            timeframe = parse_timeframe(args[-1]) or '1d'
             query = ' '.join(args[:-1]).strip()
         else:
             timeframe = '1d'
@@ -1024,7 +1017,7 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("형식: /ak 삼성전자 또는 /ak 005930")
             return
 
-        print("[AK COMMAND]", query)
+        print("[AK COMMAND]", query, timeframe)
 
         processing_msg = await update.message.reply_text(f"검색 중... {query}")
 
@@ -1038,8 +1031,7 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # 완전 일치 → 차트 생성
         if ticker:
             name = result
-            print("[AK MAP FOUND]", ticker, name)
-            print("[AK FINAL]", ticker, name)
+            print(f"[AK] ticker={ticker} name={name} tf={timeframe}")
             chart_path, caption = create_kr_stock_chart(ticker, name, timeframe)
             try:
                 with open(chart_path, 'rb') as f:
@@ -1148,7 +1140,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/au AAPL → 미국 주식\n"
         "/au TSLA 4h → 인터벌 지정\n"
         "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y\n"
-        "(한국 주식: 1d / 1w / 1y만 지원)\n"
+        "(한국 주식: 1h/4h/12h 요청 시 일봉으로 대체)\n"
         "\n"
         "🔧 디버그 (관리자)\n"
         "/nettest → 서버 네트워크 접근 테스트"
