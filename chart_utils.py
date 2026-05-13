@@ -1300,9 +1300,18 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     # 시장 정보 캐시에서 조회 (KIS API 호출 전에 결정)
     try:
         cache  = _get_krx_cache()
-        _, market = cache['by_ticker'].get(bare, (name, ''))
-    except Exception:
+        entry  = cache['by_ticker'].get(bare)
+        if entry:
+            _, market = entry
+            print(f"[KR CHART] {name}({bare}) → cache hit: market={market}")
+        else:
+            market = ''
+            print(f"[KR CHART] {name}({bare}) → cache miss: market 미정")
+    except Exception as exc:
         market = ''
+        print(f"[KR CHART] {name}({bare}) → cache error: {exc}")
+
+    print(f"[KR CHART] KIS 조회 시작: name={name!r} code={bare!r} market={market!r}")
 
     # ── 현재가: KIS API 우선, 실패 시 pykrx 마지막 종가 ──────────────
     kis = fetch_kis_stock_price(bare, market=market)
@@ -1556,34 +1565,50 @@ def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
     """
     한국투자증권 OpenAPI 현재가 조회 (TR_ID: FHKST01010100).
 
-    code  : 6자리 종목코드 (예: '328130')
+    code  : 종목코드 (6자리로 zero-pad 처리)
     market: 'KOSPI' | 'KOSDAQ' | 'ETF' | '' (빈 값이면 캐시에서 자동 조회)
 
     시장 코드:
       KOSPI  → fid_cond_mrkt_div_code = 'J'
       KOSDAQ → fid_cond_mrkt_div_code = 'Q'
-      ETF    → 'J' 시도 후 실패 시 'Q' fallback
+      ETF    → 'J' 시도 후 'Q' fallback
+      KONEX  → 'J' 시도 후 'Q' fallback
 
     Returns dict or None.
     """
+    # ── 종목코드 6자리 강제 처리 ──────────────────────────────────────
+    code = str(code).zfill(6)
+
     token = get_kis_access_token()
     if not token:
+        print(f"[KIS REQUEST] code={code} → 토큰 없음 (KIS_APP_KEY/KIS_APP_SECRET 환경변수 확인)")
         return None
 
     app_key    = os.getenv('KIS_APP_KEY', '').strip()
     app_secret = os.getenv('KIS_APP_SECRET', '').strip()
 
     # ── 시장 코드 결정 ────────────────────────────────────────────────
+    original_market = market
     if not market:
         try:
             cache = _get_krx_cache()
-            _, market = cache['by_ticker'].get(code, (code, 'KOSPI'))
-        except Exception:
+            entry = cache['by_ticker'].get(code)
+            if entry:
+                _, market = entry
+                print(f"[KIS LOOKUP] code={code} → cache hit: market={market}")
+            else:
+                market = 'KOSPI'
+                print(f"[KIS LOOKUP] code={code} → cache miss, default market=KOSPI")
+        except Exception as exc:
             market = 'KOSPI'
+            print(f"[KIS LOOKUP] code={code} → cache error ({exc}), default market=KOSPI")
+    else:
+        print(f"[KIS LOOKUP] code={code} → market 직접 지정={market}")
 
     _MKT_CODE = {'KOSPI': 'J', 'KOSDAQ': 'Q', 'ETF': 'J', 'KONEX': 'J'}
     primary   = _MKT_CODE.get(market, 'J')
-    # fallback 순서: 주 시장 코드 → 반대 코드 (J↔Q) → ETF 특수 처리
+
+    # fallback 순서: 주 시장 코드 → 반대 코드 (J↔Q)
     if primary == 'J':
         candidates = ['J', 'Q']
     else:
@@ -1611,18 +1636,25 @@ def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
     }
 
     for mrkt_code in candidates:
-        print(f"[KIS REQUEST] code={code} market={market} fid_cond_mrkt_div_code={mrkt_code}")
+        params = {
+            'fid_cond_mrkt_div_code': mrkt_code,
+            'fid_input_iscd':         code,
+        }
+        print(
+            f"[KIS REQUEST] {{'market': '{mrkt_code}', 'code': '{code}', "
+            f"'resolved_market': '{market}', 'original_market': '{original_market}'}}"
+        )
         try:
             r = requests.get(
                 f'{_KIS_BASE}/uapi/domestic-stock/v1/quotations/inquire-price',
                 headers=headers,
-                params={
-                    'fid_cond_mrkt_div_code': mrkt_code,  # 소문자 필수
-                    'fid_input_iscd':         code,
-                },
+                params=params,
                 timeout=10,
             )
-            print(f"[KIS RESPONSE] HTTP {r.status_code}")
+
+            print(f"[KIS RESPONSE] HTTP status_code={r.status_code}")
+            print(f"[KIS RESPONSE] body={r.text[:500]}")
+
             if r.status_code != 200:
                 logger.error("[KIS PRICE] %s HTTP %d: %s", code, r.status_code, r.text[:300])
                 continue
@@ -1631,24 +1663,35 @@ def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
             rt_cd  = j.get('rt_cd',  '?')
             msg_cd = j.get('msg_cd', '')
             msg1   = j.get('msg1',   '')
-            print(f"[KIS RESPONSE] rt_cd={rt_cd} msg_cd={msg_cd} msg1={msg1}")
+            out    = j.get('output', {})
+
+            print(
+                f"[KIS RESPONSE] rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r} "
+                f"stck_prpr={out.get('stck_prpr')!r}"
+            )
 
             if rt_cd != '0':
                 logger.error(
                     "[KIS PRICE] %s mrkt=%s rt_cd=%s msg_cd=%s msg1=%s",
                     code, mrkt_code, rt_cd, msg_cd, msg1,
                 )
-                # 종목코드 오류류면 fallback 불필요
+                print(
+                    f"[KIS FAILURE] code={code} mrkt_code={mrkt_code} "
+                    f"rt_cd={rt_cd!r} msg_cd={msg_cd!r} msg1={msg1!r}"
+                )
+                # 종목코드 자체 오류면 다른 시장 코드로 재시도해도 의미 없음
                 if msg_cd in ('OPSP0003U', 'EGW00123'):
+                    print(f"[KIS FAILURE] 종목코드 오류 msg_cd={msg_cd!r} → fallback 중단")
                     break
-                continue  # 다른 시장 코드로 재시도
+                continue
 
-            out   = j.get('output', {})
             price = _int(out, 'stck_prpr')
 
             if price == 0:
-                # 시장 닫힘 등으로 0 반환 → 다른 코드 시도
-                print(f"[KIS RESPONSE] price=0 for {code} mrkt={mrkt_code} → next candidate")
+                print(
+                    f"[KIS RESPONSE] price=0 for code={code} mrkt={mrkt_code} "
+                    f"→ 시장 닫힘 또는 잘못된 코드, next candidate"
+                )
                 continue
 
             change     = _int(out,   'prdy_vrss')
@@ -1667,8 +1710,12 @@ def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
                 change     = abs(change)
                 change_pct = abs(change_pct) if sign_code in ('1', '2') else change_pct
 
-            logger.info("[KIS PRICE] code=%s price=%s change_pct=%s%%", code, price, change_pct)
-            print(f"[KIS PRICE] code={code} mrkt={mrkt_code} price={price:,} change_pct={change_pct:+.2f}%")
+            logger.info("[KIS PRICE] code=%s mrkt=%s price=%s change_pct=%s%%",
+                        code, mrkt_code, price, change_pct)
+            print(
+                f"[KIS SUCCESS] code={code} mrkt_code={mrkt_code} market={market} "
+                f"price={price:,} change_pct={change_pct:+.2f}%"
+            )
             return {
                 'price':      price,
                 'change':     change,
@@ -1682,8 +1729,10 @@ def fetch_kis_stock_price(code: str, market: str = '') -> 'dict | None':
 
         except Exception as e:
             logger.error("[KIS PRICE] %s mrkt=%s 오류: %s", code, mrkt_code, e)
+            print(f"[KIS ERROR] code={code} mrkt={mrkt_code} exception={e}")
 
-    logger.warning("[KIS PRICE] %s: 모든 시장 코드 실패", code)
+    logger.warning("[KIS PRICE] %s: 모든 시장 코드 실패 (market=%s)", code, market)
+    print(f"[KIS FAIL ALL] code={code} market={market} candidates={candidates} → None 반환")
     return None
 
 
