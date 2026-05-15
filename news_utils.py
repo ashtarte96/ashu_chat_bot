@@ -374,20 +374,166 @@ def _dedupe_within(items: list) -> list:
     return result
 
 
-# ── 번역 ──────────────────────────────────────────────────────────────────────
+# ── Rule-based 번역 테이블 (API 실패 시 fallback) ────────────────────────────
+# 긴 구문(multi-word) → 짧은 단어(single) 순서로 배치
+
+_PHRASE_MAP: list[tuple[str, str]] = [
+    # 복합 구문 (먼저)
+    ('all-time high',          '사상 최고가'),
+    ('all time high',          '사상 최고가'),
+    ('all-time low',           '사상 최저가'),
+    ('federal reserve',        '연방준비제도'),
+    ('interest rate',          '금리'),
+    ('rate hike',              '금리 인상'),
+    ('rate cut',               '금리 인하'),
+    ('rate cuts',              '금리 인하'),
+    ('spot etf',               '현물 ETF'),
+    ('stock market',           '주식시장'),
+    ('trade war',              '무역전쟁'),
+    ('market rally',           '시장 랠리'),
+    ('market crash',           '시장 폭락'),
+    ('bitcoin etf',            '비트코인 ETF'),
+    ('ethereum etf',           '이더리움 ETF'),
+    ('us senate',              '미 상원'),
+    ('u.s. senate',            '미 상원'),
+    ('u.s.',                   '미국'),
+    ('banking committee',      '은행위원회'),
+    ('clarity act',            'CLARITY 법안'),
+    ('jp morgan',              'JP모건'),
+    ('q1 ',                    '1분기 '),
+    ('q2 ',                    '2분기 '),
+    ('q3 ',                    '3분기 '),
+    ('q4 ',                    '4분기 '),
+    # 코인
+    ('bitcoin',                '비트코인'),
+    ('ethereum',               '이더리움'),
+    ('solana',                 '솔라나'),
+    ('ripple',                 '리플'),
+    ('dogecoin',               '도지코인'),
+    ('litecoin',               '라이트코인'),
+    ('polkadot',               '폴카닷'),
+    ('avalanche',              '아발란체'),
+    ('chainlink',              '체인링크'),
+    # 기관
+    ('blackrock',              '블랙록'),
+    ('jpmorgan',               'JP모건'),
+    ('fidelity',               '피델리티'),
+    ('microstrategy',          '마이크로스트래티지'),
+    ('binance',                '바이낸스'),
+    ('coinbase',               '코인베이스'),
+    ('dartmouth',              '다트머스'),
+    ('grayscale',              '그레이스케일'),
+    # 크립토 용어
+    ('cryptocurrency',         '암호화폐'),
+    ('crypto',                 '크립토'),
+    ('blockchain',             '블록체인'),
+    ('stablecoin',             '스테이블코인'),
+    # 매크로·규제
+    ('inflation',              '인플레이션'),
+    ('deflation',              '디플레이션'),
+    ('recession',              '경기침체'),
+    ('tariffs',                '관세'),
+    ('tariff',                 '관세'),
+    ('nasdaq',                 '나스닥'),
+    ('senate',                 '상원'),
+    ('congress',               '의회'),
+    ('committee',              '위원회'),
+    ('regulation',             '규제'),
+    ('regulatory',             '규제'),
+    ('institutional',          '기관'),
+    ('endowment',              '기금'),
+    ('billion',                '억 달러'),
+    ('million',                '백만 달러'),
+    # 동작·상태
+    ('outflows',               '자금 유출'),
+    ('outflow',                '자금 유출'),
+    ('inflows',                '자금 유입'),
+    ('inflow',                 '자금 유입'),
+    ('surges',                 '급등'),
+    ('surge',                  '급등'),
+    ('plunges',                '급락'),
+    ('plunge',                 '급락'),
+    ('rally',                  '랠리'),
+    ('crash',                  '폭락'),
+    ('exposure',               '비중'),
+    ('approved',               '승인'),
+    ('approval',               '승인'),
+    ('launches',               '출시'),
+    ('launch',                 '출시'),
+    ('upgrade',                '업그레이드'),
+    ('lifts',                  '확대'),
+    ('sheds',                  '자금 유출'),
+    ('shed',                   '자금 유출'),
+    ('investment',             '투자'),
+    # 수식어
+    ('largest',                '최대'),
+    ('biggest',                '최대'),
+    ('record',                 '기록'),
+    ('daily',                  '일간'),
+    ('weekly',                 '주간'),
+    ('monthly',                '월간'),
+    ('largest daily',          '최대 일간'),
+]
+
+
+def _rule_translate(text: str) -> str:
+    result = text
+    for eng, kor in _PHRASE_MAP:
+        if ' ' in eng or '-' in eng or '.' in eng:
+            pattern = re.compile(re.escape(eng), re.IGNORECASE)
+        else:
+            pattern = re.compile(r'\b' + re.escape(eng) + r'\b', re.IGNORECASE)
+        result = pattern.sub(kor, result)
+    return result
+
+
+def _is_mostly_english(text: str) -> bool:
+    if not text:
+        return False
+    ascii_count = sum(1 for c in text if ord(c) < 128 and c.isalpha())
+    alpha_count = sum(1 for c in text if c.isalpha())
+    return (ascii_count / alpha_count) > 0.7 if alpha_count else False
+
+
+# ── 번역 (GoogleTranslator → MyMemory → rule-based 순서) ─────────────────────
 
 def _translate_ko(text: str) -> str:
     if not text:
         return text
+
+    text_in = text[:500]
+    print(f"[TRANSLATE RAW] {text_in[:80]}")
+
+    # 1. GoogleTranslator
     try:
         from deep_translator import GoogleTranslator
-        translated = GoogleTranslator(source='auto', target='ko').translate(text[:500])
-        if not translated:
-            return text
-        translated = re.sub(r'[​‌‍⁠﻿]', '', translated)
-        return translated.strip() or text
-    except Exception:
-        return text
+        result = GoogleTranslator(source='auto', target='ko').translate(text_in)
+        if result:
+            result = re.sub(r'[​‌‍⁠﻿]', '', result).strip()
+            if result and not _is_mostly_english(result):
+                print(f"[TRANSLATE KO] google: {result[:80]}")
+                return result
+        print("[TRANSLATE] google → 영어 반환, fallback 시도")
+    except Exception as e:
+        print(f"[TRANSLATE] GoogleTranslator 실패: {e}")
+
+    # 2. MyMemoryTranslator
+    try:
+        from deep_translator import MyMemoryTranslator
+        result = MyMemoryTranslator(source='en-US', target='ko-KR').translate(text_in)
+        if result:
+            result = re.sub(r'[​‌‍⁠﻿]', '', result).strip()
+            if result and not _is_mostly_english(result):
+                print(f"[TRANSLATE KO] mymemory: {result[:80]}")
+                return result
+        print("[TRANSLATE] mymemory → 영어 반환, rule-based 시도")
+    except Exception as e:
+        print(f"[TRANSLATE] MyMemoryTranslator 실패: {e}")
+
+    # 3. rule-based fallback
+    result = _rule_translate(text_in)
+    print(f"[TRANSLATE KO] rule-based: {result[:80]}")
+    return result
 
 
 def _clean_desc(raw: str) -> str:
@@ -408,7 +554,11 @@ def _make_summary(item: dict) -> str:
         desc = ' '.join(sentences[:2])
         if len(desc) > 250:
             desc = desc[:247] + '...'
-    return _translate_ko(desc)
+    result = _translate_ko(desc)
+    # 번역 실패 시 fallback 요약
+    if _is_mostly_english(result):
+        return "관련 이슈가 전해짐."
+    return result
 
 
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
