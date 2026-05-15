@@ -387,6 +387,16 @@ def _normalize_query(text: str) -> str:
     return text.lower()
 
 
+def normalize_stock_code(code) -> str:
+    """종목코드를 6자리 문자열로 정규화. int 변환 절대 금지."""
+    raw = str(code).strip()
+    digits = re.sub(r'\D', '', raw)   # 숫자만 추출 (비숫자 제거)
+    result = digits.zfill(6)
+    if raw != result:
+        print(f'[NORMALIZE CODE] raw={raw!r} → {result}')
+    return result
+
+
 # ── Kiwoom REST API + KRX KIND 종목 검색 ──────────────────────────────
 
 _KIWOOM_API_BASE = 'https://api.kiwoom.com'
@@ -459,18 +469,33 @@ def _load_kind_stock_list() -> list:
            '?method=download&searchType=13')
     try:
         r = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
-        soup = BeautifulSoup(r.content, 'lxml')
+        # KRX KIND 응답은 EUC-KR 인코딩 — bytes 직접 파싱 시 코드 깨짐 방지
+        r.encoding = 'euc-kr'
+        soup = BeautifulSoup(r.text, 'html.parser')
         rows = soup.select('table tr')
         items = []
+        logged = 0
         for row in rows[1:]:
             cols = row.select('td')
             if len(cols) < 2:
                 continue
-            name       = cols[0].get_text(strip=True)
-            code       = cols[1].get_text(strip=True).zfill(6)
+            name     = cols[0].get_text(strip=True)
+            raw_code = cols[1].get_text(strip=True)
+            # 숫자만 추출 후 6자리 정규화 (int 변환 절대 금지)
+            digits   = re.sub(r'\D', '', raw_code)
+            if not digits:
+                continue
+            code = digits.zfill(6)
+            # 유효성: 반드시 6자리 숫자
+            if not re.fullmatch(r'\d{6}', code):
+                print(f'[KRX KIND] 코드 스킵: raw={raw_code!r} → {code!r}')
+                continue
             market_raw = cols[2].get_text(strip=True) if len(cols) > 2 else ''
             market     = _MARKET_MAP.get(market_raw, market_raw)
-            if code and name:
+            if name:
+                if logged < 5:
+                    print(f'[KR SEARCH RESULT] raw_code={raw_code!r} normalized_code={code}')
+                    logged += 1
                 items.append((code, name, market))
         print(f'[KRX KIND] 종목 수: {len(items)}')
         return items
@@ -522,16 +547,20 @@ def kiwoom_search_stock(query: str) -> 'dict | None':
 
     # 1. 6자리 코드 직접 조회
     if re.fullmatch(r'\d{1,6}', query.strip()):
-        code_key = query.strip().zfill(6)
+        code_key = normalize_stock_code(query.strip())
         if code_key in cache['by_code']:
-            result = cache['by_code'][code_key]
+            result = dict(cache['by_code'][code_key])
+            result['code'] = normalize_stock_code(result['code'])
+            print(f'[KR SEARCH RESULT] raw_code={query.strip()!r} normalized_code={result["code"]}')
             print(f'[KIWOOM SEARCH] code exact: {result}')
             _KR_SEARCH_CACHE[norm] = (result, now)
             return result
 
     # 2. 정규화 정확 매칭
     if norm in cache['by_norm']:
-        result = cache['by_norm'][norm]
+        result = dict(cache['by_norm'][norm])
+        result['code'] = normalize_stock_code(result['code'])
+        print(f'[KR SEARCH RESULT] raw_code={result["code"]!r} normalized_code={result["code"]}')
         print(f'[KIWOOM SEARCH] norm exact: {result}')
         _KR_SEARCH_CACHE[norm] = (result, now)
         return result
@@ -543,7 +572,9 @@ def kiwoom_search_stock(query: str) -> 'dict | None':
     ]
     if matches:
         matches.sort(key=lambda x: len(x['name']))
-        result = matches[0]
+        result = dict(matches[0])
+        result['code'] = normalize_stock_code(result['code'])
+        print(f'[KR SEARCH RESULT] raw_code={matches[0]["code"]!r} normalized_code={result["code"]}')
         print(f'[KIWOOM SEARCH] contains match ({len(matches)} hits): {result}')
         _KR_SEARCH_CACHE[norm] = (result, now)
         return result
@@ -555,7 +586,7 @@ def kiwoom_search_stock(query: str) -> 'dict | None':
 
 def kiwoom_get_price(code: str) -> 'dict | None':
     """Kiwoom REST API 현재가 조회. Returns dict or None."""
-    code = str(code).strip().zfill(6)
+    code = normalize_stock_code(code)
     headers = _kiwoom_headers()
     url = f'{_KIWOOM_API_BASE}/v1/stock/price'
     payload = {'stk_cd': code}
@@ -631,11 +662,17 @@ def kiwoom_get_price(code: str) -> 'dict | None':
 def _fetch_naver_ohlcv(ticker: str, count: int = 365) -> pd.DataFrame:
     """Naver fchart XML 파싱 → OHLCV DataFrame (UTC index)."""
     import lxml.etree as ET
+    ticker = normalize_stock_code(ticker)
     url = (f'https://fchart.stock.naver.com/sise.nhn'
            f'?symbol={ticker}&timeframe=day&count={count}&requestType=0')
     try:
         r = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
-        root = ET.fromstring(r.content)
+        # BOM 및 XML 선언 앞 공백 제거 → "XML declaration allowed only at the start" 방지
+        raw = r.content
+        if raw.startswith(b'\xef\xbb\xbf'):   # UTF-8 BOM
+            raw = raw[3:]
+        raw = raw.strip()
+        root = ET.fromstring(raw)
         rows = []
         for item in root.iter('item'):
             d = item.get('data', '')
@@ -672,7 +709,7 @@ def kiwoom_get_chart_ohlcv(code: str, timeframe: str = '1d') -> pd.DataFrame:
     Returns DataFrame [open, high, low, close, volume], UTC DatetimeIndex.
     """
     from pykrx import stock as pykrx_stock
-    code = str(code).strip().zfill(6)
+    code = normalize_stock_code(code)   # int 변환 방지 + 항상 6자리 문자열
 
     # 분봉은 pykrx 미지원 → 일봉으로 대체
     fetch_tf = '1d' if timeframe in ('1h', '4h', '12h') else timeframe
@@ -688,6 +725,7 @@ def kiwoom_get_chart_ohlcv(code: str, timeframe: str = '1d') -> pd.DataFrame:
     print(f'[KIWOOM CHART] pykrx code={code} fetch_tf={fetch_tf} from={from_date}')
     df = pd.DataFrame()
     try:
+        print(f'[PYKRX CALL] ticker={code}')
         df = pykrx_stock.get_market_ohlcv_by_date(from_date, today_str, code)
     except Exception as e:
         print(f'[KIWOOM CHART] pykrx 오류: {e}')
@@ -784,7 +822,8 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     1h/4h/12h: kiwoom이 분봉 지원 → 분봉 차트 표시 (불가 시 일봉 대체).
     Returns (file_path, caption) or raises.
     """
-    bare = _bare_kr_ticker(ticker)
+    bare = normalize_stock_code(_bare_kr_ticker(ticker))
+    print(f'[AK CHART] ticker={bare} name={name!r} timeframe={timeframe}')
 
     # ── OHLCV ──────────────────────────────────────────────────────────
     df_raw = None
