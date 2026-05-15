@@ -1984,6 +1984,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/news [btc|eth|sol|...] → 최신 크립토 뉴스 즉시 출력 (테스트 모드)."""
+    print("[CMD_NEWS START]")
     if not update.message:
         return
 

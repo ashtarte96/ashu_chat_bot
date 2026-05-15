@@ -536,7 +536,7 @@ def _make_summary(item: dict) -> str:
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
 def _build_briefing(items: list, period: str) -> str:
-    print(f"[NEWS FINAL] _build_briefing: items={len(items)} period={period}")
+    print(f"[BUILD_BRIEFING START] items={len(items)} period={period}")
 
     if period == 'morning':
         header = "🐰 아슈 특파원 아침 출동"
@@ -546,7 +546,7 @@ def _build_briefing(items: list, period: str) -> str:
         header = "🐰 아슈 특파원 저녁 출동"
 
     if len(items) == 0:
-        print("[NEWS FINAL] items is EMPTY → returning empty message")
+        print("[EMPTY BRANCH TRIGGERED]")
         return (
             f"{header}\n\n"
             "🐰 아슈 특파원 출동!\n"
@@ -555,12 +555,14 @@ def _build_briefing(items: list, period: str) -> str:
 
     message = f"{header}\n\n"
 
-    for item in items:
+    for idx, item in enumerate(items):
         title   = (item.get('title')    or '').strip()
         summary = (item.get('_summary') or '').strip()
         url     = (item.get('url')      or '').strip()
+        print(f"[ITEM {idx}] title={title[:60]!r} summary_len={len(summary)} url={'Y' if url else 'N'}")
 
         if not title:
+            print(f"[ITEM {idx}] SKIP — title empty")
             continue
 
         message += f"📰 {title}\n"
@@ -573,9 +575,12 @@ def _build_briefing(items: list, period: str) -> str:
         if url:
             message += f"🔗 링크:\n{url}\n\n"
 
+        print(f"[MESSAGE LEN] {len(message)}")
+
     print("[NEWS MESSAGE]")
     print(message[:3000])
-    print(f"[BUILD RESULT] len={len(message)}")
+    print(f"[RETURN MESSAGE] len={len(message)}")
+    print(message[:1000])
     return message
 
 
@@ -694,6 +699,7 @@ def get_briefing(
             hours=try_hours, max_items=max_items,
             query_filter=query_filter, use_cache=use_cache,
         )
+        print(f"[GET_CRYPTO_NEWS] count={len(items)} try_hours={try_hours}")
         if len(items) >= 1:
             if try_hours != hours:
                 print(f"[NEWS FETCH] hours={hours} 부족 → hours={try_hours} 결과 사용")
@@ -701,6 +707,7 @@ def get_briefing(
         print(f"[NEWS FETCH] hours={try_hours} → 0개, 범위 확대")
 
     print(f"[NEWS SEND] 최종 {len(items)}개 브리핑 생성")
+    print(f"[CALL BUILD_BRIEFING] items={len(items)}")
     return _build_briefing(items, period)
 
 
