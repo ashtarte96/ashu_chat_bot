@@ -8,7 +8,6 @@ import json as _json
 import logging
 import os
 import re
-import subprocess
 import tempfile
 import time as _time
 import traceback as tb
@@ -370,7 +369,7 @@ def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
         raise ValueError(f"yfinance 조회 실패: {ticker}") from e
 
 
-# ── Korean stocks (kiwoom-cli based) ──────────────────────────────────
+# ── Korean stocks (Kiwoom REST API + KRX KIND) ────────────────────────
 
 # Market → suffix  (bare 6-digit code + suffix for logging)
 _MARKET_SUFFIX: dict = {
@@ -388,113 +387,197 @@ def _normalize_query(text: str) -> str:
     return text.lower()
 
 
-# ── kiwoom-cli wrapper ─────────────────────────────────────────────────
+# ── Kiwoom REST API + KRX KIND 종목 검색 ──────────────────────────────
 
-_KIWOOM_SEARCH_CACHE: dict = {}  # norm_query → (result_dict, timestamp)
-_KIWOOM_CACHE_TTL = 600          # 10 minutes
+_KIWOOM_API_BASE = 'https://api.kiwoom.com'
+_KIWOOM_TOKEN_CACHE: dict = {'token': None, 'expires_at': 0.0}
+_KRX_STOCK_CACHE: dict = {'items': [], 'by_code': {}, 'by_norm': {}, 'date': ''}
+_KR_SEARCH_CACHE: dict = {}
+_KR_SEARCH_TTL = 600
+
+_MARKET_MAP: dict = {
+    '유가': 'KOSPI', '코스피': 'KOSPI', 'kospi': 'KOSPI', 'KOSPI': 'KOSPI',
+    '코스닥': 'KOSDAQ', 'KOSDAQ': 'KOSDAQ', 'KONEX': 'KONEX',
+    '유가증권': 'KOSPI',
+}
 
 
-def _kiwoom_run(*args, timeout: int = 10):
-    """Run `kiwoom -f json <args>` and return parsed JSON. None on failure."""
-    cmd = ['kiwoom', '-f', 'json'] + [str(a) for a in args]
-    print(f"[KIWOOM CMD] {' '.join(cmd)}")
+def get_kiwoom_access_token() -> 'str | None':
+    """POST oauth2/token (client_credentials). 24h token, 5-min buffer."""
+    cache = _KIWOOM_TOKEN_CACHE
+    now = _time.time()
+    if cache['token'] and now < cache['expires_at']:
+        return cache['token']
+
+    app_key = os.environ.get('KIWOOM_APP_KEY', '')
+    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
+    if not app_key or not secret:
+        print('[TOKEN REFRESH] KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 환경변수 미설정')
+        return None
+
+    print('[TOKEN REFRESH] 토큰 요청 중...')
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if proc.returncode != 0:
-            print(f"[KIWOOM STDERR] returncode={proc.returncode} stderr={proc.stderr[:500]}")
-        stdout = proc.stdout.strip()
-        if stdout:
-            try:
-                return _json.loads(stdout)
-            except _json.JSONDecodeError:
-                print(f"[KIWOOM RAW] {stdout[:500]}")
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"[KIWOOM TIMEOUT] timed out after {timeout}s: {' '.join(cmd)}")
-        return None
-    except FileNotFoundError:
-        print("[KIWOOM ERROR] kiwoom 명령어를 찾을 수 없습니다. pip install kiwoom-cli 확인")
-        return None
+        r = requests.post(
+            f'{_KIWOOM_API_BASE}/oauth2/token',
+            json={'grant_type': 'client_credentials', 'appkey': app_key, 'secretkey': secret},
+            timeout=10,
+        )
+        print(f'[TOKEN REFRESH] status={r.status_code}')
+        j = r.json()
+        token = j.get('access_token') or j.get('token') or j.get('accessToken')
+        if not token:
+            print(f'[TOKEN REFRESH] 토큰 필드 없음: {str(j)[:300]}')
+            return None
+        expires_in = int(j.get('expires_in', 86400))
+        cache['token'] = token
+        cache['expires_at'] = now + expires_in - 300
+        print(f'[TOKEN REFRESH] 토큰 갱신 성공 (expires_in={expires_in}s)')
+        return token
     except Exception as e:
-        print(f"[KIWOOM ERROR] {e}")
+        print(f'[TOKEN REFRESH] 오류: {e}')
         return None
 
 
-def _kiwoom_parse_stock_item(item: dict) -> dict:
-    """Extract code/name/market from a kiwoom search result item."""
-    code = (item.get('stk_cd') or item.get('code') or
-            item.get('ticker') or item.get('item_code') or '')
-    name = (item.get('stk_nm') or item.get('name') or
-            item.get('stk_name') or item.get('item_name') or '')
-    market = (item.get('mrkt_nm') or item.get('market') or
-              item.get('mrkt_cd') or item.get('market_name') or '')
-    return {
-        'code':   str(code).strip().zfill(6),
-        'name':   str(name).strip(),
-        'market': str(market).strip(),
-    }
+def _kiwoom_headers() -> dict:
+    token   = get_kiwoom_access_token()
+    app_key = os.environ.get('KIWOOM_APP_KEY', '')
+    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
+    h = {'Content-Type': 'application/json'}
+    if token:
+        h['Authorization'] = f'Bearer {token}'
+    if app_key:
+        h['appkey'] = app_key
+    if secret:
+        h['secretkey'] = secret
+    return h
+
+
+def _load_kind_stock_list() -> list:
+    """KRX KIND에서 상장 종목 전체 목록 취득. Returns [(code, name, market), ...]"""
+    from bs4 import BeautifulSoup
+    url = ('http://kind.krx.co.kr/corpgeneral/corpList.do'
+           '?method=download&searchType=13')
+    try:
+        r = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
+        soup = BeautifulSoup(r.content, 'lxml')
+        rows = soup.select('table tr')
+        items = []
+        for row in rows[1:]:
+            cols = row.select('td')
+            if len(cols) < 2:
+                continue
+            name       = cols[0].get_text(strip=True)
+            code       = cols[1].get_text(strip=True).zfill(6)
+            market_raw = cols[2].get_text(strip=True) if len(cols) > 2 else ''
+            market     = _MARKET_MAP.get(market_raw, market_raw)
+            if code and name:
+                items.append((code, name, market))
+        print(f'[KRX KIND] 종목 수: {len(items)}')
+        return items
+    except Exception as e:
+        print(f'[KRX KIND] 오류: {e}')
+        return []
+
+
+def _get_krx_stock_cache() -> dict:
+    """일별 갱신 KIND 캐시. keys: items, by_code, by_norm."""
+    today = str(date.today())
+    cache = _KRX_STOCK_CACHE
+    if cache['date'] == today and cache['items']:
+        return cache
+
+    items = _load_kind_stock_list()
+    if not items:
+        return cache
+
+    by_code: dict = {}
+    by_norm: dict = {}
+    for code, name, market in items:
+        entry = {'code': code, 'name': name, 'market': market}
+        by_code[code] = entry
+        nk = _normalize_query(name)
+        if nk not in by_norm:
+            by_norm[nk] = entry
+    cache.update({'items': items, 'by_code': by_code, 'by_norm': by_norm, 'date': today})
+    return cache
 
 
 def kiwoom_search_stock(query: str) -> 'dict | None':
     """
-    kiwoom-cli로 종목 검색.
+    KRX KIND 종목 검색.
     Returns {'code': '328130', 'name': '루닛', 'market': 'KOSDAQ'} or None.
     Cache: 10분.
     """
     norm = _normalize_query(query)
     now  = _time.time()
 
-    if norm in _KIWOOM_SEARCH_CACHE:
-        cached, ts = _KIWOOM_SEARCH_CACHE[norm]
-        if now - ts < _KIWOOM_CACHE_TTL:
-            print(f"[KIWOOM SEARCH] cache hit: query={query!r} → {cached}")
+    if norm in _KR_SEARCH_CACHE:
+        cached, ts = _KR_SEARCH_CACHE[norm]
+        if now - ts < _KR_SEARCH_TTL:
+            print(f'[KIWOOM SEARCH] cache hit: query={query!r} → {cached}')
             return cached
 
-    print(f"[KIWOOM SEARCH] query={query!r}")
-    data = _kiwoom_run('stock', 'search', query, timeout=10)
+    print(f'[KIWOOM SEARCH] query={query!r} norm={norm!r}')
+    cache = _get_krx_stock_cache()
 
-    if data is None:
-        print(f"[KIWOOM SEARCH] no data for query={query!r}")
-        return None
+    # 1. 6자리 코드 직접 조회
+    if re.fullmatch(r'\d{1,6}', query.strip()):
+        code_key = query.strip().zfill(6)
+        if code_key in cache['by_code']:
+            result = cache['by_code'][code_key]
+            print(f'[KIWOOM SEARCH] code exact: {result}')
+            _KR_SEARCH_CACHE[norm] = (result, now)
+            return result
 
-    items = data if isinstance(data, list) else (
-        data.get('results') or data.get('items') or
-        data.get('data')    or data.get('list')  or []
-    )
-    if not items:
-        print(f"[KIWOOM SEARCH RESULT] query={query!r} → 0 results (raw={str(data)[:200]})")
-        return None
+    # 2. 정규화 정확 매칭
+    if norm in cache['by_norm']:
+        result = cache['by_norm'][norm]
+        print(f'[KIWOOM SEARCH] norm exact: {result}')
+        _KR_SEARCH_CACHE[norm] = (result, now)
+        return result
 
-    print(f"[KIWOOM SEARCH RESULT] query={query!r} → {len(items)} results")
+    # 3. 부분 일치 (norm 포함, 이름 짧은 것 우선)
+    matches = [
+        entry for entry in cache['by_code'].values()
+        if norm in _normalize_query(entry['name'])
+    ]
+    if matches:
+        matches.sort(key=lambda x: len(x['name']))
+        result = matches[0]
+        print(f'[KIWOOM SEARCH] contains match ({len(matches)} hits): {result}')
+        _KR_SEARCH_CACHE[norm] = (result, now)
+        return result
 
-    # 1. 정규화된 이름 정확 매칭 우선
-    for item in items:
-        parsed = _kiwoom_parse_stock_item(item)
-        if _normalize_query(parsed['name']) == norm:
-            print(f"[KIWOOM SEARCH RESULT] exact match: code={parsed['code']} name={parsed['name']!r}")
-            _KIWOOM_SEARCH_CACHE[norm] = (parsed, now)
-            return parsed
-
-    # 2. 첫 번째 결과
-    parsed = _kiwoom_parse_stock_item(items[0])
-    print(f"[KIWOOM SEARCH RESULT] first result: code={parsed['code']} name={parsed['name']!r}")
-    _KIWOOM_SEARCH_CACHE[norm] = (parsed, now)
-    return parsed
+    print(f'[KIWOOM SEARCH] not found: query={query!r}')
+    _KR_SEARCH_CACHE[norm] = (None, now)
+    return None
 
 
 def kiwoom_get_price(code: str) -> 'dict | None':
-    """kiwoom-cli로 현재가 조회. Returns dict or None."""
-    code = str(code).zfill(6)
-    print(f"[KIWOOM PRICE] fetching code={code}")
-    data = _kiwoom_run('stock', 'price', code, timeout=10)
-    if data is None:
+    """Kiwoom REST API 현재가 조회. Returns dict or None."""
+    code = str(code).strip().zfill(6)
+    headers = _kiwoom_headers()
+    url = f'{_KIWOOM_API_BASE}/v1/stock/price'
+    payload = {'stk_cd': code}
+    print(f'[KIWOOM REQUEST] POST {url} payload={payload}')
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        print(f'[KIWOOM RESPONSE] status={r.status_code} body={r.text[:300]}')
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception as e:
+        print(f'[KIWOOM REQUEST] 오류: {e}')
         return None
 
-    # 응답이 리스트인 경우 첫 번째 항목 사용
     if isinstance(data, list):
         data = data[0] if data else {}
-
-    print(f"[KIWOOM PRICE] raw={str(data)[:300]}")
+    if isinstance(data, dict) and 'data' in data:
+        inner = data['data']
+        if isinstance(inner, list):
+            data = inner[0] if inner else {}
+        elif isinstance(inner, dict):
+            data = inner
 
     def _to_int(*keys) -> int:
         for k in keys:
@@ -520,21 +603,20 @@ def kiwoom_get_price(code: str) -> 'dict | None':
                 pass
         return 0.0
 
-    price      = _to_int('cur_prc', 'price', 'close', 'clos_pric', 'stck_prpr', 'current_price')
-    change     = _to_int('prv_diff', 'change', 'diff', 'prdy_vrss', 'price_change')
-    change_pct = _to_float('diff_rt', 'change_pct', 'change_rate', 'prdy_ctrt', 'rate')
-    volume     = _to_int('trde_vol', 'volume', 'acml_vol', 'acc_volume')
-    open_p     = _to_int('open_pric', 'open', 'stck_oprc')
-    high_p     = _to_int('hgst_pric', 'high', 'stck_hgpr', 'high_price')
-    low_p      = _to_int('lwst_pric', 'low',  'stck_lwpr', 'low_price')
+    price      = _to_int('cur_pric', 'cur_prc', 'price', 'close', 'stck_prpr', 'current_price', 'clos_pric')
+    change     = _to_int('bfdy_vrss', 'prdy_vrss', 'prv_diff', 'change', 'diff', 'price_change')
+    change_pct = _to_float('bfdy_ctrt', 'prdy_ctrt', 'diff_rt', 'change_pct', 'rate', 'change_rate')
+    volume     = _to_int('acml_vol', 'trde_vol', 'volume', 'acc_volume')
+    open_p     = _to_int('open_pric', 'stck_oprc', 'open')
+    high_p     = _to_int('hgst_pric', 'stck_hgpr', 'high_price', 'high')
+    low_p      = _to_int('lwst_pric', 'stck_lwpr', 'low_price', 'low')
 
-    # 부호 처리 — 필드명에 'sign' 또는 음수값 포함 여부로 판단
-    sign = str(data.get('prv_diff_sign', data.get('sign', data.get('change_sign', ''))) or '')
+    sign = str(data.get('prdy_vrss_sign', data.get('bfdy_vrss_sign', data.get('sign', ''))) or '')
     if sign in ('2', '하락', 'FALL') or change_pct < 0:
         change     = -abs(change)
         change_pct = -abs(change_pct)
 
-    print(f"[KIWOOM PRICE] code={code} price={price:,} change_pct={change_pct:+.2f}% volume={volume:,}")
+    print(f'[KIWOOM RESPONSE] code={code} price={price:,} change_pct={change_pct:+.2f}% volume={volume:,}')
     return {
         'price':      price,
         'change':     change,
@@ -546,94 +628,106 @@ def kiwoom_get_price(code: str) -> 'dict | None':
     }
 
 
+def _fetch_naver_ohlcv(ticker: str, count: int = 365) -> pd.DataFrame:
+    """Naver fchart XML 파싱 → OHLCV DataFrame (UTC index)."""
+    import lxml.etree as ET
+    url = (f'https://fchart.stock.naver.com/sise.nhn'
+           f'?symbol={ticker}&timeframe=day&count={count}&requestType=0')
+    try:
+        r = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+        root = ET.fromstring(r.content)
+        rows = []
+        for item in root.iter('item'):
+            d = item.get('data', '')
+            parts = d.split('|')
+            if len(parts) < 5:
+                continue
+            try:
+                rows.append({
+                    'date':   parts[0].strip(),
+                    'open':   float(parts[1]),
+                    'high':   float(parts[2]),
+                    'low':    float(parts[3]),
+                    'close':  float(parts[4]),
+                    'volume': float(parts[5]) if len(parts) > 5 else 0.0,
+                })
+            except (ValueError, IndexError):
+                pass
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['dt'] = pd.to_datetime(df['date'], format='%Y%m%d', errors='coerce')
+        df = df.dropna(subset=['dt']).sort_values('dt')
+        df.index = df['dt'].dt.tz_localize('Asia/Seoul').dt.tz_convert('UTC')
+        return df[['open', 'high', 'low', 'close', 'volume']].copy()
+    except Exception as e:
+        print(f'[NAVER OHLCV] 오류: {e}')
+        return pd.DataFrame()
+
+
 def kiwoom_get_chart_ohlcv(code: str, timeframe: str = '1d') -> pd.DataFrame:
     """
-    kiwoom-cli stock chart 명령으로 OHLCV DataFrame 취득.
-    timeframe: 1h / 4h / 12h / 1d / 1w / 1y
+    pykrx (primary) + Naver fchart (fallback) OHLCV DataFrame.
+    timeframe: 1h/4h/12h → 일봉 대체, 1d / 1w / 1y 지원.
     Returns DataFrame [open, high, low, close, volume], UTC DatetimeIndex.
     """
-    code = str(code).zfill(6)
+    from pykrx import stock as pykrx_stock
+    code = str(code).strip().zfill(6)
 
-    _TF_ARGS: dict = {
-        '1h':  ('chart', 'minute', code, '--interval', '60'),
-        '4h':  ('chart', 'minute', code, '--interval', '240'),
-        '12h': ('chart', 'minute', code, '--interval', '720'),
-        '1d':  ('chart', 'day',    code),
-        '1w':  ('chart', 'week',   code),
-        '1y':  ('chart', 'year',   code),
-    }
-    tf_args = _TF_ARGS.get(timeframe, ('chart', 'day', code))
-    cmd_args = ('stock',) + tf_args
-    print(f"[KIWOOM CHART] code={code} tf={timeframe} → kiwoom -f json {' '.join(cmd_args)}")
+    # 분봉은 pykrx 미지원 → 일봉으로 대체
+    fetch_tf = '1d' if timeframe in ('1h', '4h', '12h') else timeframe
 
-    data = _kiwoom_run(*cmd_args, timeout=15)
-    if data is None:
-        raise ValueError(f"[KIWOOM CHART] no data for code={code} timeframe={timeframe}")
+    today_str = datetime.now().strftime('%Y%m%d')
+    if fetch_tf == '1d':
+        from_date = (datetime.now() - timedelta(days=500)).strftime('%Y%m%d')
+    elif fetch_tf == '1w':
+        from_date = (datetime.now() - timedelta(days=365 * 3)).strftime('%Y%m%d')
+    else:  # 1y → 월봉 대체
+        from_date = (datetime.now() - timedelta(days=365 * 10)).strftime('%Y%m%d')
 
-    candles = data if isinstance(data, list) else (
-        data.get('candles') or data.get('data') or data.get('ohlcv') or
-        data.get('chart')   or data.get('list') or []
-    )
-    if not candles:
-        raise ValueError(f"[KIWOOM CHART] empty candles for code={code} (raw={str(data)[:200]})")
-
-    rows = []
-    for c in candles:
-        date_val = (c.get('date') or c.get('dt') or c.get('stck_bsop_date') or
-                    c.get('candle_date_time_kst') or c.get('time') or
-                    c.get('bas_dt') or '')
-        def _fv(k_list):
-            for k in k_list:
-                v = c.get(k)
-                if v is not None:
-                    try:
-                        return float(str(v).replace(',', ''))
-                    except (ValueError, TypeError):
-                        pass
-            return 0.0
-        open_v  = _fv(['open',  'open_pric',  'stck_oprc'])
-        high_v  = _fv(['high',  'hgst_pric',  'stck_hgpr', 'high_price'])
-        low_v   = _fv(['low',   'lwst_pric',  'stck_lwpr', 'low_price'])
-        close_v = _fv(['close', 'clos_pric',  'stck_clpr', 'close_price'])
-        vol_v   = _fv(['volume','trde_vol',   'acml_vol',  'acc_volume'])
-        rows.append({
-            'date': str(date_val).strip(),
-            'open': open_v, 'high': high_v, 'low': low_v,
-            'close': close_v, 'volume': vol_v,
-        })
-
-    if not rows:
-        raise ValueError(f"[KIWOOM CHART] failed to parse candles for code={code}")
-
-    df = pd.DataFrame(rows)
-    parsed = None
-    for fmt in ('%Y%m%d%H%M%S', '%Y%m%d%H%M', '%Y%m%d',
-                '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
-        try:
-            parsed = pd.to_datetime(df['date'], format=fmt, errors='raise')
-            break
-        except (ValueError, TypeError):
-            pass
-    if parsed is None:
-        parsed = pd.to_datetime(df['date'], infer_datetime_format=True, errors='coerce')
-
-    df['dt'] = parsed
-    df = df.dropna(subset=['dt']).sort_values('dt')
+    print(f'[KIWOOM CHART] pykrx code={code} fetch_tf={fetch_tf} from={from_date}')
+    df = pd.DataFrame()
     try:
-        df.index = df['dt'].dt.tz_localize('Asia/Seoul').dt.tz_convert('UTC')
-    except Exception:
-        df.index = df['dt'].dt.tz_convert('UTC')
+        df = pykrx_stock.get_market_ohlcv_by_date(from_date, today_str, code)
+    except Exception as e:
+        print(f'[KIWOOM CHART] pykrx 오류: {e}')
+
+    if df is None or df.empty:
+        print(f'[KIWOOM CHART] pykrx 실패 → Naver fchart fallback code={code}')
+        df = _fetch_naver_ohlcv(code, count=500)
+
+    if df is None or df.empty:
+        raise ValueError(f'차트 데이터 없음: code={code}')
+
+    # pykrx 컬럼 한글 → 영문 정규화
+    col_map = {'시가': 'open', '고가': 'high', '저가': 'low', '종가': 'close', '거래량': 'volume'}
+    df = df.rename(columns=col_map)
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # pykrx 인덱스(DatetimeIndex 또는 date)를 UTC 변환
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        try:
+            df.index = df.index.tz_localize('Asia/Seoul').tz_convert('UTC')
+        except Exception:
+            df.index = df.index.tz_convert('UTC')
+
+    df = df.sort_index()
     df = df[['open', 'high', 'low', 'close', 'volume']].copy()
     df = df.dropna(subset=['open', 'close'])
+    df = df[df['close'] > 0]
 
-    print(f"[KIWOOM CHART OK] code={code} tf={timeframe} rows={len(df)}")
+    print(f'[KIWOOM CHART OK] code={code} tf={timeframe} rows={len(df)}')
     return df
 
 
 
 def find_kr_stock(query: str):
     """
-    kiwoom-cli 기반 한국 주식/ETF 검색.
+    KRX KIND 기반 한국 주식/ETF 검색.
     Returns (ticker_with_suffix, name) on unique match.
     Returns (None, []) on failure.
     """
