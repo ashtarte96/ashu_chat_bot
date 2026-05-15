@@ -2013,7 +2013,9 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
     chat_id = update.effective_chat.id
-    print(f"[NEWS SEND] /news{label} → chat_id={chat_id} len={len(text)}")
+    is_empty = "없었슈" in text
+    print(f"[TELEGRAM NEWS SEND] len={len(text)} is_empty_msg={is_empty} chat_id={chat_id}")
+    print(text[:1000])
     for chunk in _split_message(text):
         await update.message.reply_text(chunk, disable_web_page_preview=True)
     print(f"[NEWS SEND] /news{label} sent OK")

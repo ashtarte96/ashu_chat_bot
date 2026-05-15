@@ -536,6 +536,8 @@ def _make_summary(item: dict) -> str:
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
 def _build_briefing(items: list, period: str) -> str:
+    print(f"[NEWS FINAL] _build_briefing: items={len(items)} period={period}")
+
     if period == 'morning':
         header = "🐰 아슈 특파원 아침 출동"
     elif period == 'test':
@@ -543,23 +545,23 @@ def _build_briefing(items: list, period: str) -> str:
     else:
         header = "🐰 아슈 특파원 저녁 출동"
 
-    if not items:
+    if len(items) == 0:
+        print("[NEWS FINAL] items is EMPTY → returning empty message")
         return (
             f"{header}\n\n"
             "🐰 아슈 특파원 출동!\n"
             "오늘은 큰 이슈가 없었슈 😴"
         )
 
-    lines = [header, ""]
-    for item in items:
-        lines.append(f"📰 {item['title']}")
-        lines.append(f"➡️ {item['_summary']}")
-        lines.append("")
-        lines.append("🔗 링크:")
-        lines.append(item['url'])
-        lines.append("")
+    message = f"{header}\n\n"
+    for article in items:
+        message += f"📰 {article['title']}\n"
+        message += f"➡️ {article['_summary']}\n\n"
+        message += f"🔗 링크:\n{article['url']}\n\n"
 
-    return '\n'.join(lines).rstrip()
+    message = message.rstrip()
+    print(f"[NEWS FINAL] message_length={len(message)} news_count={len(items)}")
+    return message
 
 
 # ── 공개 API ──────────────────────────────────────────────────────────────────
@@ -570,13 +572,13 @@ def get_crypto_news(
     query_filter: Optional[str] = None,
     use_cache: bool = True,
 ) -> list:
-    """멀티 소스 수집 → 필터 → 중복제거 → 캐시 → 점수 정렬 → max_items 반환."""
+    """멀티 소스 수집 → 필터 → 중복제거 → 캐시 → score정렬 → truncate → summary 순."""
     raw = _merge_all(hours)
 
     if query_filter:
         qf_lower = query_filter.lower()
-        kws = _QUERY_FILTER_MAP.get(qf_lower, [qf_lower])
-        before = len(raw)
+        kws      = _QUERY_FILTER_MAP.get(qf_lower, [qf_lower])
+        before   = len(raw)
         raw = [
             i for i in raw
             if any(kw in (i['title'] + ' ' + i.get('description', '')).lower()
@@ -590,39 +592,47 @@ def get_crypto_news(
     cache           = _load_cache()
     cache_skipped   = 0
     pre_cache_count = len(deduped)
-    final: list     = []
 
+    # ── Step 1: score + category (빠름, HTTP 없음) ────────────────────────────
+    candidates: list = []
     for item in deduped:
         if use_cache and _is_cached(item, cache):
             cache_skipped += 1
             continue
         item['_score']    = _score(item)
         item['_category'] = _category(item)
-        item['_summary']  = _make_summary(item)
-        final.append(item)
+        candidates.append(item)
 
     print(
         f"[NEWS DEDUPE] after_dedupe={pre_cache_count} "
-        f"cache_skipped={cache_skipped} → after_cache={len(final)} "
+        f"cache_skipped={cache_skipped} → candidates={len(candidates)} "
         f"use_cache={use_cache}"
     )
 
-    # 캐시로 인해 3개 미만이 되면 캐시를 무시하고 재처리
-    if use_cache and len(final) < 3 and cache_skipped > 0:
+    # 캐시로 인해 3개 미만이면 캐시 무시 재처리
+    if use_cache and len(candidates) < 3 and cache_skipped > 0:
         print(
-            f"[NEWS DEDUPE] final={len(final)} < 3, cache_skipped={cache_skipped} "
-            f"→ cache bypass 재처리"
+            f"[NEWS DEDUPE] candidates={len(candidates)} < 3, "
+            f"cache_skipped={cache_skipped} → cache bypass"
         )
-        final = []
+        candidates = []
         for item in deduped:
             item['_score']    = _score(item)
             item['_category'] = _category(item)
-            item['_summary']  = _make_summary(item)
-            final.append(item)
+            candidates.append(item)
 
-    final.sort(key=lambda x: x['_score'], reverse=True)
-    final = final[:max_items]
+    # ── Step 2: 정렬 + 절단 (summary 전에 먼저) ──────────────────────────────
+    candidates.sort(key=lambda x: x['_score'], reverse=True)
+    final = candidates[:max_items]
 
+    # ── Step 3: 상위 N개만 번역 요약 (핵심 수정) ─────────────────────────────
+    print(f"[FINAL NEWS COUNT] count={len(final)} (번역 시작)")
+    for item in final:
+        raw_sum = _make_summary(item)
+        # 번역 실패 시 원문 제목 fallback
+        item['_summary'] = raw_sum.strip() if raw_sum.strip() else item['title']
+
+    # ── 최종 로그 ─────────────────────────────────────────────────────────────
     crypto_n = sum(1 for i in final if i.get('_category') == 'crypto')
     macro_n  = sum(1 for i in final if i.get('_category') == 'macro')
     global_n = len(final) - crypto_n - macro_n
@@ -638,7 +648,8 @@ def get_crypto_news(
         print(
             f"[NEWS FINAL] [{i}] score={item['_score']} "
             f"src={item.get('_source','?')} "
-            f"title={item['title'][:60]}"
+            f"summary_len={len(item.get('_summary',''))} "
+            f"title={item['title'][:55]}"
         )
 
     if use_cache:
