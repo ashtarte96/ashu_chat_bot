@@ -92,22 +92,27 @@ def normalize_symbol(ticker: str) -> str:
 
 
 def format_price(price: float) -> str:
-    if price >= 1000:
+    """가격 포맷.
+    >= 1 : 천단위 콤마 + 소수 2자리  (예: 12,345.68 / 12.34)
+    < 1  : 소수 4자리, 불필요한 후행 0 제거 (예: 0.9234 / 0.04 / 0.0031)
+    절대 int 변환 금지."""
+    if price >= 1:
         return f"{price:,.2f}"
-    elif price >= 1:
-        return f"{price:.4f}"
-    else:
-        return f"{price:.8f}"
+    s = f"{price:.4f}".rstrip('0').rstrip('.')
+    return s if s else '0'
 
 
 def _fmt_kr(price: float) -> str:
-    return f"{int(round(price)):,}"
+    """KRW 가격 포맷 (국내주식 정수 원화 / 1원 미만 코인 공용)."""
+    if price >= 1:
+        return f"{round(price):,}"
+    s = f"{price:.4f}".rstrip('0').rstrip('.')
+    return s if s else '0'
 
 
 def _fmt_us(price: float) -> str:
-    if price >= 1000:
-        return f"{price:,.2f}"
-    return f"{price:.2f}"
+    """USD 가격 포맷 — format_price와 동일 로직."""
+    return format_price(price)
 
 
 def _change_line(current: float, prev: float, fmt_fn=None) -> str:
@@ -951,13 +956,13 @@ def create_kr_stock_chart(ticker: str, name: str, timeframe: str = '1d'):
     lines = [
         f"{sign_emoji} {name} ({bare}) 차트",
         f"🕒 Timeframe: {caption_tf}\n",
-        f"💰 현재가: ₩{int(current_price):,}",
+        f"💰 현재가: ₩{_fmt_kr(current_price)}",
         f"📊 등락률: {pct_str} ({amt_str}원)",
     ]
     if volume > 0:
         lines.append(f"📦 거래량: {volume:,}")
-    lines.append(f"\n52주 최고: ₩{int(high_52w):,}")
-    lines.append(f"52주 최저: ₩{int(low_52w):,}")
+    lines.append(f"\n52주 최고: ₩{_fmt_kr(high_52w)}")
+    lines.append(f"52주 최저: ₩{_fmt_kr(low_52w)}")
     if market:
         lines.append(f"\n🏢 시장: {market}")
 

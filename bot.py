@@ -50,6 +50,9 @@ from telegram.ext import (
     filters,
 )
 
+import datetime as _dt
+
+import news_utils
 from database import Database
 from chart_utils import (
     create_clean_candlestick_chart,
@@ -79,7 +82,8 @@ if not TELEGRAM_BOT_TOKEN:
         "  $env:TELEGRAM_BOT_TOKEN='your_token'   (PowerShell)"
     )
 
-MUTE_HOURS = 24
+MUTE_HOURS     = 24
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
 
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -1326,9 +1330,9 @@ async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(result, dict) and result.get('success'):
         kr_lines = []
         if upbit_price is not None:
-            kr_lines.append(f"🇰🇷 업비트: ₩{int(upbit_price):,}")
+            kr_lines.append(f"🇰🇷 업비트: ₩{format_price(upbit_price)}")
         if bithumb_price is not None:
-            kr_lines.append(f"🇰🇷 빗썸:   ₩{int(bithumb_price):,}")
+            kr_lines.append(f"🇰🇷 빗썸:   ₩{format_price(bithumb_price)}")
         if kr_lines:
             result['caption'] = (result.get('caption') or '') + '\n\n' + '\n'.join(kr_lines)
 
@@ -1934,6 +1938,81 @@ async def cmd_nettest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # ═══════════════════════════════════════════════════
+# 뉴스 브리핑
+# ═══════════════════════════════════════════════════
+
+def _split_message(text: str, max_len: int = 4000) -> list:
+    """텔레그램 4096자 제한에 맞게 메시지 분할."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        split_at = text.rfind('\n\n', 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip()
+    return chunks
+
+
+async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """스케줄러가 호출하는 자동 뉴스 브리핑 발송 함수."""
+    data    = context.job.data or {}
+    chat_id = data.get('chat_id')
+    period  = data.get('period', 'morning')
+    hours   = 12 if period == 'morning' else 9
+    print(f"[NEWS SEND] {period} briefing → chat_id={chat_id} hours={hours}")
+    try:
+        text = await asyncio.to_thread(
+            news_utils.get_briefing, hours, period, None, True
+        )
+        for chunk in _split_message(text):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                disable_web_page_preview=True,
+            )
+        print(f"[NEWS SEND] {period} briefing sent OK")
+    except Exception:
+        print(f"[NEWS SEND] Error sending {period} briefing:")
+        import traceback
+        traceback.print_exc()
+
+
+async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/news [키워드] → 최신 크립토 뉴스 즉시 출력."""
+    if not update.message:
+        return
+
+    query_filter: str | None = context.args[0].lower() if context.args else None
+
+    now_kst = datetime.now(KST)
+    period  = 'morning' if now_kst.hour < 14 else 'evening'
+
+    label = f" ({query_filter.upper()})" if query_filter else ""
+    processing_msg = await update.message.reply_text(f"📰 뉴스 수집 중{label}...")
+
+    try:
+        text = await asyncio.to_thread(
+            news_utils.get_briefing, 24, period, query_filter, False
+        )
+    except Exception as e:
+        logger.error("[NEWS SEND] cmd_news error: %s", e)
+        text = f"뉴스 조회 실패: {e}"
+
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    for chunk in _split_message(text):
+        await update.message.reply_text(chunk, disable_web_page_preview=True)
+
+
+# ═══════════════════════════════════════════════════
 # 봇 시작
 # ═══════════════════════════════════════════════════
 
@@ -1957,6 +2036,34 @@ def main() -> None:
     app.add_handler(CommandHandler('ak',        ak_chart))
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
+    app.add_handler(CommandHandler('news',      cmd_news))
+
+    # 뉴스 자동 발송 스케줄러 (TARGET_CHAT_ID 환경변수 필요)
+    if TARGET_CHAT_ID and app.job_queue:
+        try:
+            chat_id_int = int(TARGET_CHAT_ID)
+            app.job_queue.run_daily(
+                news_briefing_job,
+                time=_dt.time(8, 0, 0, tzinfo=KST),
+                data={'chat_id': chat_id_int, 'period': 'morning'},
+                name='morning_news',
+            )
+            app.job_queue.run_daily(
+                news_briefing_job,
+                time=_dt.time(17, 0, 0, tzinfo=KST),
+                data={'chat_id': chat_id_int, 'period': 'evening'},
+                name='evening_news',
+            )
+            logger.info(
+                "[NEWS SEND] Scheduled 08:00 & 17:00 KST → chat_id=%s", TARGET_CHAT_ID
+            )
+        except ValueError:
+            logger.warning("[NEWS SEND] TARGET_CHAT_ID is not a valid integer: %s", TARGET_CHAT_ID)
+    elif TARGET_CHAT_ID:
+        logger.warning(
+            "[NEWS SEND] TARGET_CHAT_ID set but job_queue unavailable. "
+            "Install: python-telegram-bot[job-queue]"
+        )
 
     # InlineKeyboard 콜백 핸들러
     app.add_handler(
