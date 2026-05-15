@@ -546,10 +546,11 @@ def _load_kind_listing() -> list:
     KRX KIND 공시시스템에서 전체 상장종목 수집 (단일 HTTP 요청, 로그인 불필요).
     http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13
     Naver 스크래핑이 실패/부족할 때 사용하는 fallback.
+    pd.read_html() 미사용 — requests + BeautifulSoup 직접 파싱.
     Returns [(ticker_6digit, name, market), ...]
     """
     try:
-        from io import StringIO
+        from bs4 import BeautifulSoup
         r = requests.get(
             'http://kind.krx.co.kr/corpgeneral/corpList.do',
             params={'method': 'download', 'searchType': '13'},
@@ -561,34 +562,66 @@ def _load_kind_listing() -> list:
         )
         r.raise_for_status()
         r.encoding = 'euc-kr'
-        tables = pd.read_html(StringIO(r.text))
-        if not tables:
-            logger.warning("[KIND] no tables found")
+
+        soup  = BeautifulSoup(r.text, 'lxml')
+        table = soup.find('table')
+        if not table:
+            logger.warning("[KIND] table not found in response")
             return []
-        df = tables[0]
-        cols = {str(c).strip(): c for c in df.columns}
-        name_col = next((cols[c] for c in cols if '회사명' in c or '종목명' in c), None)
-        code_col = next((cols[c] for c in cols if '종목코드' in c or '코드' in c), None)
-        mkt_col  = next((cols[c] for c in cols if '시장구분' in c or '시장' in c), None)
-        if not name_col or not code_col:
-            logger.warning("[KIND] required columns not found: %s", list(df.columns))
+
+        # 헤더 행 파싱
+        header_row = table.find('tr')
+        if not header_row:
+            logger.warning("[KIND] header row not found")
             return []
+        headers = [th.get_text(strip=True) for th in header_row.find_all(['th', 'td'])]
+        print(f"[KIND] headers={headers}")
+
+        name_idx = next((i for i, h in enumerate(headers) if '회사명' in h or '종목명' in h), None)
+        code_idx = next((i for i, h in enumerate(headers) if '종목코드' in h or '코드' in h), None)
+        mkt_idx  = next((i for i, h in enumerate(headers) if '시장구분' in h or '시장' in h), None)
+
+        if name_idx is None or code_idx is None:
+            logger.warning("[KIND] required columns not found. headers=%s", headers)
+            return []
+
+        print(f"[KIND] col idx → name={name_idx} code={code_idx} market={mkt_idx}")
+
         results = []
-        for _, row in df.iterrows():
-            raw_ticker = str(row[code_col]).strip().split('.')[0].zfill(6)
+        for tr in table.find_all('tr')[1:]:
+            cells = tr.find_all(['td', 'th'])
+            if not cells:
+                continue
+            if code_idx >= len(cells) or name_idx >= len(cells):
+                continue
+
+            raw_ticker = cells[code_idx].get_text(strip=True).split('.')[0].zfill(6)
             if not raw_ticker.isdigit() or len(raw_ticker) != 6:
                 continue
-            name = str(row[name_col]).strip()
-            if not name or name in ('nan', 'NaN'):
+
+            name = cells[name_idx].get_text(strip=True)
+            if not name or name in ('nan', 'NaN', ''):
                 continue
+
             market = 'KOSPI'
-            if mkt_col:
-                mkt_raw = str(row[mkt_col]).strip()
-                market = _MARKET_MAP.get(mkt_raw, _MARKET_MAP.get(mkt_raw[:2], 'KOSPI'))
+            if mkt_idx is not None and mkt_idx < len(cells):
+                mkt_raw = cells[mkt_idx].get_text(strip=True)
+                market  = _MARKET_MAP.get(mkt_raw, _MARKET_MAP.get(mkt_raw[:2], 'KOSPI'))
+
             results.append((raw_ticker, name, market))
+
         k = sum(1 for _, _, m in results if m == 'KOSPI')
         q = sum(1 for _, _, m in results if m == 'KOSDAQ')
         print(f"[KIND LISTING] KOSPI={k} KOSDAQ={q} total={len(results)}")
+
+        # debug: 핵심 종목 확인
+        for target in ['루닛', '레인보우로보틱스', '에코프로비엠', '알테오젠']:
+            found = [(t, n, m) for t, n, m in results if target in n]
+            if found:
+                print(f"[KIND] ✓ {target} → {found[:1]}")
+            else:
+                print(f"[KIND] ✗ {target} NOT FOUND")
+
         return results
     except Exception as e:
         logger.warning("[KIND LISTING] failed: %s", e)
@@ -643,14 +676,13 @@ def _parse_market_soup(soup, market: str, results: list, seen: set) -> int:
     Naver sise_market_sum 페이지 soup에서 종목코드+이름 추출.
     반환: 이번 페이지에서 신규 추가된 종목 수.
 
-    전략 1: table.type_2 a[href*="code="]  (테이블 범위 내 종목 링크)
-    전략 2: a[href*="item/main.naver?code="]  (전체 페이지 fallback)
+    /item/main.naver?code= 링크만 선택 (종목명 링크 전용).
+    sise_day / frgn 등 비-종목 링크를 제외해 seen 오염 방지.
     """
     added = 0
 
-    links = soup.select('table.type_2 a[href*="code="]')
-    if not links:
-        links = soup.select('a[href*="item/main.naver?code="]')
+    # 오직 종목 상세 페이지 링크만 선택 — 이 링크만 종목명을 텍스트로 가짐
+    links = soup.select('a[href*="/item/main.naver?code="]')
 
     for a in links:
         href = a.get('href', '')
@@ -659,10 +691,13 @@ def _parse_market_soup(soup, market: str, results: list, seen: set) -> int:
             continue
         ticker = m.group(1)
         name   = a.get_text(strip=True)
-        if ticker and name and ticker not in seen:
-            results.append((ticker, name, market))
-            seen.add(ticker)
-            added += 1
+        if not ticker or not name:
+            continue
+        if ticker in seen:
+            continue
+        results.append((ticker, name, market))
+        seen.add(ticker)
+        added += 1
     return added
 
 
@@ -695,67 +730,93 @@ def _load_naver_market(sosok: int) -> list:
     Naver Finance sise_market_sum에서 KOSPI(sosok=0)/KOSDAQ(sosok=1) 전체 종목 수집.
 
     알고리즘:
-      1) 첫 페이지 로드 → pgRR로 마지막 페이지 번호 탐지
-      2) 2 ~ last_page 전 페이지 순회 (중간 오류가 있어도 건너뜀)
-      3) 각 페이지에서 종목코드+이름 추출
+      1) 첫 페이지 로드 → td.pgRR a 로 마지막 페이지 번호 탐지
+      2) 2 ~ last_page 전 페이지 순회 (각 페이지 최대 3회 재시도)
+      3) a[href*="/item/main.naver?code="] 로만 종목코드+이름 추출
 
     Returns [(ticker_6digit, name, market), ...]
     """
     import time as _time
     from bs4 import BeautifulSoup
 
-    market    = 'KOSPI' if sosok == 0 else 'KOSDAQ'
-    base_url  = (
+    market   = 'KOSPI' if sosok == 0 else 'KOSDAQ'
+    base_url = (
         'https://finance.naver.com/sise/sise_market_sum.naver'
         f'?sosok={sosok}'
     )
-    results:  list = []
-    seen:     set  = set()
-    last_page = 50  # default safety limit
+    results: list = []
+    seen:    set  = set()
+    last_page = 50  # 기본값 (pgRR 탐지 실패 시 안전망)
+
+    def _fetch_page(page: int, max_retry: int = 3):
+        """재시도 포함 단일 페이지 fetch. 실패 시 None 반환."""
+        for attempt in range(1, max_retry + 1):
+            try:
+                r = requests.get(
+                    f'{base_url}&page={page}',
+                    headers=_NAVER_HEADERS,
+                    timeout=15,
+                )
+                r.encoding = 'euc-kr'
+                return BeautifulSoup(r.text, 'lxml')
+            except Exception as e:
+                logger.warning("[%s] page=%d attempt=%d error: %s", market, page, attempt, e)
+                if attempt < max_retry:
+                    _time.sleep(1.0 * attempt)
+        return None
 
     # ── 1. 첫 페이지 + 마지막 페이지 탐지 ────────────────────────────
-    try:
-        r = requests.get(f'{base_url}&page=1', headers=_NAVER_HEADERS, timeout=15)
-        r.encoding = 'euc-kr'
-        soup = BeautifulSoup(r.text, 'lxml')
-        last_page = _detect_last_page(soup)
-        cnt = _parse_market_soup(soup, market, results, seen)
-        print(f"[{market} LOAD] 마지막 페이지={last_page}  page=1: {cnt}개")
-    except Exception as e:
-        logger.error("[%s] page=1 failed: %s", market, e)
+    soup1 = _fetch_page(1)
+    if soup1 is None:
+        logger.error("[%s] page=1 영구 실패", market)
         return results
 
+    last_page = _detect_last_page(soup1)
+    cnt = _parse_market_soup(soup1, market, results, seen)
+    print(f"[{market} LOAD] last_page={last_page}  page=1: +{cnt}개 (누적={len(results)})")
+
     # ── 2. 2 ~ last_page 전 페이지 순회 ──────────────────────────────
+    # consecutive_empty 기준을 10으로 높여 rate-limit 일시 실패 허용
     consecutive_empty = 0
     for page in range(2, last_page + 1):
-        _time.sleep(0.15)   # Naver 서버 부하 방지
-        try:
-            r = requests.get(
-                f'{base_url}&page={page}', headers=_NAVER_HEADERS, timeout=15)
-            r.encoding = 'euc-kr'
-            soup = BeautifulSoup(r.text, 'lxml')
+        _time.sleep(0.2)
+        soup = _fetch_page(page)
+        if soup is None:
+            logger.warning("[%s] page=%d 최종 실패 → skip", market, page)
+            consecutive_empty += 1
+        else:
             cnt = _parse_market_soup(soup, market, results, seen)
-
             if cnt == 0:
                 consecutive_empty += 1
-                logger.debug("[%s] page=%d: 0개 (연속 빈 페이지=%d)",
-                             market, page, consecutive_empty)
-                # 3페이지 연속 빈 경우만 중단 (일시적 파싱 실패 대비)
-                if consecutive_empty >= 3:
-                    print(f"[{market} LOAD] 3페이지 연속 빈 페이지 → 종료 (page={page})")
-                    break
+                logger.debug("[%s] page=%d +0개 (연속 빈=%d)", market, page, consecutive_empty)
             else:
                 consecutive_empty = 0
 
-            if page % 10 == 0:
-                print(f"[{market} LOAD] page={page}/{last_page} 누적={len(results)}")
+        # 10페이지 연속 빈 경우에만 중단 (일시적 rate-limit 대비)
+        if consecutive_empty >= 10:
+            print(f"[{market} LOAD] 연속 빈 10페이지 → 조기 종료 (page={page})")
+            break
 
-        except Exception as e:
-            logger.warning("[%s] page=%d error (skip): %s", market, page, e)
+        if page % 5 == 0 or page == last_page:
+            print(f"[{market} LOAD] page={page}/{last_page} 누적={len(results)}")
 
-    print(f"[NAVER STOCK LOAD] {market} count={len(results)}")
-    if results:
-        print(f"[{market} LOAD] 샘플 5개: {[(t,n) for t,n,_ in results[:5]]}")
+    print(f"[NAVER STOCK LOAD] {market} total={len(results)}")
+
+    # ── 3. debug: 핵심 종목 포함 여부 확인 ───────────────────────────
+    _TARGETS = {
+        'KOSDAQ': ['루닛', '레인보우', '에코프로비엠', '알테오젠'],
+        'KOSPI':  ['삼성전자', 'SK하이닉스', 'LG에너지솔루션'],
+    }
+    for target in _TARGETS.get(market, []):
+        found = [(t, n) for t, n, _ in results if target in n]
+        if found:
+            print(f"[{market} LOAD] ✓ '{target}' → {found[:2]}")
+        else:
+            print(f"[{market} LOAD] ✗ '{target}' NOT FOUND in {len(results)}개")
+
+    # head 10 출력
+    print(f"[{market} LOAD] head 10: {[(t, n) for t, n, _ in results[:10]]}")
+
     return results
 
 
@@ -986,20 +1047,25 @@ def find_kr_stock(query: str):
     query_raw  = query.strip()
     query_norm = _normalize_query(query_raw)
 
+    print(f"[KR SEARCH] query={query_raw!r} normalized={query_norm!r}")
+
     def _suffix(market: str) -> str:
         return _MARKET_SUFFIX.get(market, '')
 
     # ── 1. 6-digit code ───────────────────────────────────────────────
     if query_raw.isdigit() and len(query_raw) == 6:
         cache = _get_krx_cache()
+        print(f"[KR SEARCH] 6자리 코드 검색: cache entries={len(cache['entries'])}")
         if query_raw in cache['by_ticker']:
             name, market = cache['by_ticker'][query_raw]
             ticker_out = f"{query_raw}{_suffix(market)}"
-            print(f"[KR SEARCH] query={query_raw} matched={name} ticker={ticker_out} market={market}")
+            print(f"[KR SEARCH] matched={name!r} ticker={ticker_out} market={market} (코드 직접)")
             return ticker_out, name
+        print(f"[KR SEARCH] query={query_raw!r} matched=None (코드 없음)")
         return None, []
 
     cache = _get_krx_cache()
+    print(f"[KR SEARCH] cache entries={len(cache['entries'])}")
 
     # ── 2. Alias ──────────────────────────────────────────────────────
     resolved_norm = _KR_ALIASES.get(query_norm)
@@ -1008,7 +1074,7 @@ def find_kr_stock(query: str):
         if ticker:
             name, market = cache['by_ticker'][ticker]
             ticker_out = f"{ticker}{_suffix(market)}"
-            print(f"[KR SEARCH] query={query_raw} matched={name} ticker={ticker_out} market={market}")
+            print(f"[KR SEARCH] matched={name!r} ticker={ticker_out} market={market} (alias)")
             return ticker_out, name
 
     # ── 3. Exact normalized match ─────────────────────────────────────
@@ -1016,7 +1082,7 @@ def find_kr_stock(query: str):
     if ticker:
         name, market = cache['by_ticker'][ticker]
         ticker_out = f"{ticker}{_suffix(market)}"
-        print(f"[SEARCH]\nquery={query_raw}\nmatched={name}\nticker={ticker_out}")
+        print(f"[KR SEARCH] matched={name!r} ticker={ticker_out} market={market} (exact)")
         return ticker_out, name
 
     # ── 4. Contains match ─────────────────────────────────────────────
@@ -1029,14 +1095,15 @@ def find_kr_stock(query: str):
             t, n = contains[0]
             market = cache['by_ticker'][t][1]
             ticker_out = f"{t}{_suffix(market)}"
-            print(f"[SEARCH]\nquery={query_raw}\nmatched={n}\nticker={ticker_out}")
+            print(f"[KR SEARCH] matched={n!r} ticker={ticker_out} market={market} (contains)")
             return ticker_out, n
+        print(f"[KR SEARCH] query={query_raw!r} candidates={[(t,n) for t,n in contains[:5]]}")
         return None, contains[:5]
 
     # ── 5. Fuzzy match ────────────────────────────────────────────────
     norm_names = cache['norm_names']
     if not norm_names:
-        print(f"[KR SEARCH] query={query_raw} matched=None")
+        print(f"[KR SEARCH] query={query_raw!r} matched=None (cache 비어있음)")
         return None, []
 
     if _USE_RAPIDFUZZ:
@@ -1047,6 +1114,8 @@ def find_kr_stock(query: str):
         fuzzy_norms = [r[0] for r in results]
     else:
         fuzzy_norms = difflib.get_close_matches(query_norm, norm_names, n=5, cutoff=0.6)
+
+    print(f"[KR SEARCH] fuzzy candidates={fuzzy_norms[:5]}")
 
     if fuzzy_norms:
         fuzzy_set = set(fuzzy_norms)
@@ -1061,11 +1130,12 @@ def find_kr_stock(query: str):
             t, n = fuzzy_results[0]
             market = cache['by_ticker'][t][1]
             ticker_out = f"{t}{_suffix(market)}"
-            print(f"[KR SEARCH] query={query_raw} matched={n} ticker={ticker_out} market={market}")
+            print(f"[KR SEARCH] matched={n!r} ticker={ticker_out} market={market} (fuzzy)")
             return ticker_out, n
+        print(f"[KR SEARCH] query={query_raw!r} fuzzy multi={[(t,n) for t,n in fuzzy_results]}")
         return None, fuzzy_results
 
-    print(f"[KR SEARCH] query={query_raw} matched=None")
+    print(f"[KR SEARCH] query={query_raw!r} normalized={query_norm!r} matched=None")
     return None, []
 
 
