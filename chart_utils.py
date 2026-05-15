@@ -401,15 +401,11 @@ def normalize_stock_code(code) -> str:
 
 _KIWOOM_API_BASE = 'https://api.kiwoom.com'
 _KIWOOM_TOKEN_CACHE: dict = {'token': None, 'expires_at': 0.0}
-_KRX_STOCK_CACHE: dict = {'items': [], 'by_code': {}, 'by_norm': {}, 'date': ''}
+_KRX_STOCK_CACHE: dict = {'items': [], 'by_code': {}, 'by_norm': {}, 'loaded_at': 0.0}
 _KR_SEARCH_CACHE: dict = {}
-_KR_SEARCH_TTL = 600
-
-_MARKET_MAP: dict = {
-    '유가': 'KOSPI', '코스피': 'KOSPI', 'kospi': 'KOSPI', 'KOSPI': 'KOSPI',
-    '코스닥': 'KOSDAQ', 'KOSDAQ': 'KOSDAQ', 'KONEX': 'KONEX',
-    '유가증권': 'KOSPI',
-}
+_KR_SEARCH_TTL  = 600   # 검색 결과 캐시 10분
+_KRX_CACHE_TTL  = 600   # 종목 리스트 캐시 10분
+_KRX_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kr_stock_cache.json')
 
 
 def get_kiwoom_access_token() -> 'str | None':
@@ -462,59 +458,105 @@ def _kiwoom_headers() -> dict:
     return h
 
 
-def _load_kind_stock_list() -> list:
-    """KRX KIND에서 상장 종목 전체 목록 취득. Returns [(code, name, market), ...]"""
+def _naver_crawl_market(sosok: int, market_name: str) -> list:
+    """Naver Finance sise 페이지에서 KOSPI(sosok=0) / KOSDAQ(sosok=1) 전체 크롤링.
+    KRX data.krx.co.kr 은 LOGOUT 차단 — Naver Finance 가 유일하게 외부 IP에서 동작."""
     from bs4 import BeautifulSoup
-    url = ('http://kind.krx.co.kr/corpgeneral/corpList.do'
-           '?method=download&searchType=13')
+    base = f'https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}'
+    h   = {'User-Agent': 'Mozilla/5.0'}
+
+    # 첫 페이지 → 마지막 페이지 번호 파악
     try:
-        r = requests.get(url, timeout=20, headers={'User-Agent': 'Mozilla/5.0'})
-        # KRX KIND 응답은 EUC-KR 인코딩 — bytes 직접 파싱 시 코드 깨짐 방지
+        r = requests.get(f'{base}&page=1', headers=h, timeout=15)
         r.encoding = 'euc-kr'
         soup = BeautifulSoup(r.text, 'html.parser')
-        rows = soup.select('table tr')
-        items = []
-        logged = 0
-        for row in rows[1:]:
-            cols = row.select('td')
-            if len(cols) < 2:
-                continue
-            name     = cols[0].get_text(strip=True)
-            raw_code = cols[1].get_text(strip=True)
-            # 숫자만 추출 후 6자리 정규화 (int 변환 절대 금지)
-            digits   = re.sub(r'\D', '', raw_code)
-            if not digits:
-                continue
-            code = digits.zfill(6)
-            # 유효성: 반드시 6자리 숫자
-            if not re.fullmatch(r'\d{6}', code):
-                print(f'[KRX KIND] 코드 스킵: raw={raw_code!r} → {code!r}')
-                continue
-            market_raw = cols[2].get_text(strip=True) if len(cols) > 2 else ''
-            market     = _MARKET_MAP.get(market_raw, market_raw)
-            if name:
-                if logged < 5:
-                    print(f'[KR SEARCH RESULT] raw_code={raw_code!r} normalized_code={code}')
-                    logged += 1
-                items.append((code, name, market))
-        print(f'[KRX KIND] 종목 수: {len(items)}')
-        return items
+        pgRR = soup.select_one('td.pgRR a')
+        last_page = 1
+        if pgRR:
+            m = re.search(r'page=(\d+)', pgRR.get('href', ''))
+            if m:
+                last_page = int(m.group(1))
     except Exception as e:
-        print(f'[KRX KIND] 오류: {e}')
+        print(f'[KRX LOAD] {market_name} 첫 페이지 실패: {e}')
         return []
+
+    print(f'[KRX LOAD] {market_name} last_page={last_page}')
+    items = []
+    for page in range(1, last_page + 1):
+        try:
+            r = requests.get(f'{base}&page={page}', headers=h, timeout=15)
+            r.encoding = 'euc-kr'
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for a in soup.select('a[href*="/item/main.naver?code="]'):
+                name = a.get_text(strip=True)
+                m = re.search(r'code=(\d{6})', a.get('href', ''))
+                if m and name:
+                    items.append((normalize_stock_code(m.group(1)), name, market_name))
+        except Exception as e:
+            print(f'[KRX LOAD] {market_name} page={page} 오류: {e}')
+    print(f'[KRX LOAD] {market_name}={len(items)}')
+    return items
+
+
+def _load_pykrx_stock_list() -> list:
+    """Naver Finance sise 페이지 기반 전체 종목 로딩. Returns [(code, name, market), ...]
+    (pykrx OHLCV 는 Naver fchart 사용으로 정상 동작; ticker list 전용 KRX 엔드포인트는 LOGOUT 차단)"""
+    kospi  = _naver_crawl_market(0, 'KOSPI')
+    kosdaq = _naver_crawl_market(1, 'KOSDAQ')
+    items  = kospi + kosdaq
+    print(f'[KRX LOAD] kospi={len(kospi)} kosdaq={len(kosdaq)} total={len(items)}')
+
+    if not items:
+        print('[KRX LOAD] 전체 종목 로딩 실패')
+        return []
+
+    # 첫 5개 샘플
+    for code, name, market in items[:5]:
+        print(f'[KR SEARCH RESULT] raw_code={code!r} normalized_code={normalize_stock_code(code)} name={name!r} market={market}')
+    return items
 
 
 def _get_krx_stock_cache() -> dict:
-    """일별 갱신 KIND 캐시. keys: items, by_code, by_norm."""
-    today = str(date.today())
+    """pykrx 기반 종목 캐시. 10분 TTL, kr_stock_cache.json 영속화."""
+    now   = _time.time()
     cache = _KRX_STOCK_CACHE
-    if cache['date'] == today and cache['items']:
+
+    # 메모리 캐시가 유효하면 그대로 반환
+    if cache['items'] and now - cache['loaded_at'] < _KRX_CACHE_TTL:
         return cache
 
-    items = _load_kind_stock_list()
+    # JSON 파일 캐시 확인
+    if os.path.exists(_KRX_CACHE_FILE):
+        try:
+            with open(_KRX_CACHE_FILE, encoding='utf-8') as f:
+                saved = _json.load(f)
+            if now - saved.get('loaded_at', 0) < _KRX_CACHE_TTL and saved.get('items'):
+                items = [tuple(row) for row in saved['items']]
+                print(f'[KRX LOAD] JSON 캐시 로드: {len(items)}종목')
+                _rebuild_cache(items, now)
+                return cache
+        except Exception as e:
+            print(f'[KRX LOAD] JSON 캐시 읽기 실패: {e}')
+
+    # 새로 로딩
+    items = _load_pykrx_stock_list()
     if not items:
+        print('[KRX LOAD] 종목 로딩 실패 - 기존 캐시 유지')
         return cache
 
+    # JSON 저장
+    try:
+        with open(_KRX_CACHE_FILE, 'w', encoding='utf-8') as f:
+            _json.dump({'loaded_at': now, 'items': items}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f'[KRX LOAD] JSON 캐시 저장 실패: {e}')
+
+    _rebuild_cache(items, now)
+    return cache
+
+
+def _rebuild_cache(items: list, loaded_at: float) -> None:
+    """items 리스트로 by_code / by_norm 인덱스 재구성."""
     by_code: dict = {}
     by_norm: dict = {}
     for code, name, market in items:
@@ -523,13 +565,15 @@ def _get_krx_stock_cache() -> dict:
         nk = _normalize_query(name)
         if nk not in by_norm:
             by_norm[nk] = entry
-    cache.update({'items': items, 'by_code': by_code, 'by_norm': by_norm, 'date': today})
-    return cache
+    _KRX_STOCK_CACHE.update({
+        'items': items, 'by_code': by_code,
+        'by_norm': by_norm, 'loaded_at': loaded_at,
+    })
 
 
 def kiwoom_search_stock(query: str) -> 'dict | None':
     """
-    KRX KIND 종목 검색.
+    pykrx 기반 종목 검색 (KOSPI/KOSDAQ/ETF).
     Returns {'code': '328130', 'name': '루닛', 'market': 'KOSDAQ'} or None.
     Cache: 10분.
     """
