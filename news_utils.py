@@ -561,54 +561,69 @@ def _make_summary(item: dict) -> str:
     return result
 
 
-# ── 압축 (헤드라인 스타일 변환) ──────────────────────────────────────────────
+# ── 압축 (뉴스 헤드라인 스타일 변환) ─────────────────────────────────────────
+# 목표: 연합뉴스 / Bloomberg Korea 스타일
+# 조사(은/는/을/를/에/와) 유지, verbose 서술어만 제거, "..." 절대 없음
 
-# 번역 후 제거할 verbose 서술어
+# 제거할 verbose 서술어 (문장 끝에만 적용)
 _VERBOSE_ENDINGS_RE = re.compile(
     r'[\s,]*('
     r'것으로\s*나타났다|것으로\s*분석된다|것으로\s*전망된다'
     r'|라고\s*밝혔다|라고\s*말했다|라고\s*전했다|라고\s*알려졌다'
-    r'|하고\s*있다|하고\s*있습니다'
-    r'|했습니다|됩니다|있습니다|되었습니다|됐습니다'
+    r'|하고\s*있습니다|했습니다|됩니다|있습니다|되었습니다|됐습니다'
     r'|전망이다|분석이다|보인다|관측된다'
     r'|입니다|이다'
     r')[.。!?]?$',
     re.IGNORECASE,
 )
 
-_INLINE_VERBOSE_RE = [
-    re.compile(r'에\s*따르면\s*',      re.IGNORECASE),
-    re.compile(r'것으로\s*알려졌다\.?', re.IGNORECASE),
-]
-
 
 def _strip_verbose(text: str) -> str:
+    """문장 끝 verbose 서술어 제거. 조사 및 문장 구조는 유지."""
     result = _VERBOSE_ENDINGS_RE.sub('', text).strip().rstrip('.')
-    for p in _INLINE_VERBOSE_RE:
-        result = p.sub('', result).strip()
+    # "에 따르면" 만 인라인 제거 (의미 없는 출처 표현)
+    result = re.sub(r'에\s*따르면\s*,?\s*', '', result).strip()
     return re.sub(r'\s+', ' ', result).strip()
 
 
-def _smart_truncate(text: str, max_len: int) -> str:
+def _natural_cut(text: str, max_len: int) -> str:
+    """max_len 초과 시 자연스러운 경계에서 자름 ('...' 없음).
+    우선순위: 마침표 → 쉼표 → 공백(어절) → 강제 자름"""
     if len(text) <= max_len:
         return text
-    cut = text[:max_len - 1]
-    last_sp = cut.rfind(' ')
-    if last_sp > max_len * 0.6:
-        cut = cut[:last_sp]
-    return cut + '…'
+
+    # 1. 마침표 기준
+    pos = text.rfind('.', 0, max_len + 1)
+    if pos >= max_len * 0.5:
+        return text[:pos]
+
+    # 2. 쉼표 기준
+    pos = text.rfind(',', 0, max_len + 1)
+    if pos >= max_len * 0.5:
+        return text[:pos]
+
+    # 3. 공백 기준 (어절 경계)
+    pos = text.rfind(' ', 0, max_len + 1)
+    if pos >= max_len * 0.5:
+        return text[:pos]
+
+    # 4. 강제 자름 (최후 수단, "..." 없음)
+    return text[:max_len]
 
 
 def _compress_title(title_ko: str) -> str:
-    """제목 → 35자 이내 핵심 헤드라인."""
+    """제목 → 45자 이내 뉴스 헤드라인 스타일.
+    조사 유지, verbose 서술어 제거, '...' 없음."""
     result = _strip_verbose(title_ko)
-    return _smart_truncate(result, 35)
+    return _natural_cut(result, 45)
 
 
 def _compress_summary(summary_ko: str) -> str:
-    """요약 → 최대 2문장, 60자 이내."""
+    """요약 → 최대 2문장, 80자 이내.
+    자연스러운 문장 구조 유지."""
     if not summary_ko:
         return summary_ko
+
     sentences = re.split(r'(?<=[.!?。])\s*', summary_ko.strip())
     parts = []
     for s in [s.strip() for s in sentences if s.strip()][:2]:
@@ -616,14 +631,14 @@ def _compress_summary(summary_ko: str) -> str:
         if s:
             parts.append(s + '.')
     result = ' '.join(parts).strip()
-    return _smart_truncate(result, 60)
+    return _natural_cut(result, 80)
 
 
 def summarize_korean_news(title_ko: str, summary_ko: str) -> tuple[str, str]:
-    """번역된 한국어 제목·요약을 핵심 헤드라인 스타일로 압축."""
-    print(f"[COMPRESS IN]  title={title_ko[:50]!r}")
-    print(f"[COMPRESS IN]  summary={summary_ko[:60]!r}")
-    c_title   = _compress_title(title_ko)   or title_ko
+    """번역된 한국어 제목·요약을 뉴스 헤드라인 스타일로 변환."""
+    print(f"[COMPRESS IN]  title={title_ko[:60]!r}")
+    print(f"[COMPRESS IN]  summary={summary_ko[:80]!r}")
+    c_title   = _compress_title(title_ko)    or title_ko
     c_summary = _compress_summary(summary_ko) or summary_ko
     print(f"[COMPRESS OUT] title={c_title!r}")
     print(f"[COMPRESS OUT] summary={c_summary!r}")
