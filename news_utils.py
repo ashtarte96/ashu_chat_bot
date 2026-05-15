@@ -561,6 +561,75 @@ def _make_summary(item: dict) -> str:
     return result
 
 
+# ── 압축 (헤드라인 스타일 변환) ──────────────────────────────────────────────
+
+# 번역 후 제거할 verbose 서술어
+_VERBOSE_ENDINGS_RE = re.compile(
+    r'[\s,]*('
+    r'것으로\s*나타났다|것으로\s*분석된다|것으로\s*전망된다'
+    r'|라고\s*밝혔다|라고\s*말했다|라고\s*전했다|라고\s*알려졌다'
+    r'|하고\s*있다|하고\s*있습니다'
+    r'|했습니다|됩니다|있습니다|되었습니다|됐습니다'
+    r'|전망이다|분석이다|보인다|관측된다'
+    r'|입니다|이다'
+    r')[.。!?]?$',
+    re.IGNORECASE,
+)
+
+_INLINE_VERBOSE_RE = [
+    re.compile(r'에\s*따르면\s*',      re.IGNORECASE),
+    re.compile(r'것으로\s*알려졌다\.?', re.IGNORECASE),
+]
+
+
+def _strip_verbose(text: str) -> str:
+    result = _VERBOSE_ENDINGS_RE.sub('', text).strip().rstrip('.')
+    for p in _INLINE_VERBOSE_RE:
+        result = p.sub('', result).strip()
+    return re.sub(r'\s+', ' ', result).strip()
+
+
+def _smart_truncate(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len - 1]
+    last_sp = cut.rfind(' ')
+    if last_sp > max_len * 0.6:
+        cut = cut[:last_sp]
+    return cut + '…'
+
+
+def _compress_title(title_ko: str) -> str:
+    """제목 → 35자 이내 핵심 헤드라인."""
+    result = _strip_verbose(title_ko)
+    return _smart_truncate(result, 35)
+
+
+def _compress_summary(summary_ko: str) -> str:
+    """요약 → 최대 2문장, 60자 이내."""
+    if not summary_ko:
+        return summary_ko
+    sentences = re.split(r'(?<=[.!?。])\s*', summary_ko.strip())
+    parts = []
+    for s in [s.strip() for s in sentences if s.strip()][:2]:
+        s = _strip_verbose(s)
+        if s:
+            parts.append(s + '.')
+    result = ' '.join(parts).strip()
+    return _smart_truncate(result, 60)
+
+
+def summarize_korean_news(title_ko: str, summary_ko: str) -> tuple[str, str]:
+    """번역된 한국어 제목·요약을 핵심 헤드라인 스타일로 압축."""
+    print(f"[COMPRESS IN]  title={title_ko[:50]!r}")
+    print(f"[COMPRESS IN]  summary={summary_ko[:60]!r}")
+    c_title   = _compress_title(title_ko)   or title_ko
+    c_summary = _compress_summary(summary_ko) or summary_ko
+    print(f"[COMPRESS OUT] title={c_title!r}")
+    print(f"[COMPRESS OUT] summary={c_summary!r}")
+    return c_title, c_summary
+
+
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
 def _build_briefing(items: list, period: str) -> str:
@@ -688,6 +757,10 @@ def get_crypto_news(
         # 제목 번역 (HTML 링크 텍스트용)
         title_ko = _translate_ko(item['title'])
         item['_title_ko'] = title_ko.strip() if title_ko and title_ko.strip() else item['title']
+        # 제목·요약 헤드라인 스타일 압축
+        item['_title_ko'], item['_summary'] = summarize_korean_news(
+            item['_title_ko'], item['_summary']
+        )
 
     # 최종 로그
     crypto_n = sum(1 for i in final if i.get('_category') == 'crypto')
