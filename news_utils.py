@@ -309,6 +309,8 @@ def _make_summary(item: dict) -> str:
 def _build_briefing(items: list, period: str) -> str:
     if period == 'morning':
         header = "🐰 아슈 특파원 아침 출동"
+    elif period == 'test':
+        header = "🐰 아슈 특파원 테스트 출동"
     else:
         header = "🐰 아슈 특파원 저녁 출동"
 
@@ -316,7 +318,7 @@ def _build_briefing(items: list, period: str) -> str:
         return (
             f"{header}\n\n"
             "🐰 아슈 특파원 출동!\n"
-            "오늘은 큰 크립토 이슈가 없었쥐 😴"
+            "오늘은 큰 이슈가 없었쥐 😴"
         )
 
     lines = [header, ""]
@@ -381,11 +383,14 @@ def get_briefing(
     period: str,
     query_filter: Optional[str] = None,
     use_cache: bool = True,
+    max_items: int = 10,
 ) -> str:
     """뉴스 수집 + 포맷 합성 → Telegram 전송용 문자열 반환."""
+    label = f" filter={query_filter}" if query_filter else ""
+    print(f"[NEWS TEST] get_briefing period={period} hours={hours} max={max_items}{label}")
     items = get_crypto_news(
         hours=hours,
-        max_items=10,
+        max_items=max_items,
         query_filter=query_filter,
         use_cache=use_cache,
     )

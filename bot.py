@@ -1983,33 +1983,40 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/news [키워드] → 최신 크립토 뉴스 즉시 출력."""
+    """/news [btc|eth|sol|...] → 최신 크립토 뉴스 즉시 출력 (테스트 모드)."""
     if not update.message:
         return
 
     query_filter: str | None = context.args[0].lower() if context.args else None
-
-    now_kst = datetime.now(KST)
-    period  = 'morning' if now_kst.hour < 14 else 'evening'
-
     label = f" ({query_filter.upper()})" if query_filter else ""
+
+    print(f"[NEWS TEST] /news{label} requested by user={update.effective_user.id}")
+
     processing_msg = await update.message.reply_text(f"📰 뉴스 수집 중{label}...")
 
     try:
         text = await asyncio.to_thread(
-            news_utils.get_briefing, 24, period, query_filter, False
+            news_utils.get_briefing,
+            24,           # 최근 24시간
+            'test',       # 테스트 헤더
+            query_filter,
+            False,        # 캐시 무시 (즉시 최신 결과)
+            5,            # 기본 5개
         )
     except Exception as e:
-        logger.error("[NEWS SEND] cmd_news error: %s", e)
-        text = f"뉴스 조회 실패: {e}"
+        logger.error("[NEWS TEST] error: %s", e)
+        text = "뉴스 조회 실패: " + str(e)
 
     try:
         await processing_msg.delete()
     except Exception:
         pass
 
+    chat_id = update.effective_chat.id
+    print(f"[NEWS SEND] /news{label} → chat_id={chat_id} len={len(text)}")
     for chunk in _split_message(text):
         await update.message.reply_text(chunk, disable_web_page_preview=True)
+    print(f"[NEWS SEND] /news{label} sent OK")
 
 
 # ═══════════════════════════════════════════════════
