@@ -1,5 +1,5 @@
 """
-news_utils.py — 글로벌 크립토 뉴스 수집·필터·중복제거·번역·포맷
+news_utils.py — 글로벌 크립토 + 매크로 뉴스 수집·필터·중복제거·번역·포맷
 """
 
 import hashlib
@@ -20,23 +20,41 @@ NEWS_CACHE_FILE = "news_hash_cache.json"
 CACHE_TTL_HOURS = 48
 
 # ── 수집 키워드 ───────────────────────────────────────────────────────────────
+# 크립토 직접 이슈 (10개)
 
-CRYPTO_QUERIES = [
+_CRYPTO_QUERIES = [
     "crypto bitcoin",
     "ethereum blockchain",
-    "crypto altcoin",
     "bitcoin ETF",
-    "crypto ETF SEC",
-    "SEC crypto regulation",
-    "Binance cryptocurrency",
-    "Upbit Bybit exchange",
+    "crypto ETF SEC regulation",
+    "Binance Coinbase Upbit Bybit exchange",
     "crypto hack DeFi exploit",
-    "bitcoin institutional investment",
-    "crypto Layer2 AI",
-    "crypto policy global",
+    "bitcoin institutional investment BlackRock",
+    "crypto Layer2 AI stablecoin",
+    "altcoin XRP Solana BNB",
+    "crypto law bill congress",
 ]
 
-# 특정 티커/키워드 필터 매핑
+# 코인시장에 영향을 주는 글로벌 매크로 이슈 (13개)
+_MACRO_QUERIES = [
+    "fed fomc interest rate decision",
+    "inflation CPI PPI data US",
+    "powell federal reserve speech",
+    "nasdaq S&P500 stock market",
+    "treasury yield bond market crash",
+    "dollar DXY index strength",
+    "china economy growth recession",
+    "war geopolitical risk conflict",
+    "tariffs trade war US China",
+    "nvidia AI stocks market",
+    "oil crude energy price",
+    "global markets liquidity risk",
+    "unemployment jobs recession economy",
+]
+
+ALL_QUERIES = _CRYPTO_QUERIES + _MACRO_QUERIES
+
+# 특정 티커/키워드 필터 매핑 (/news btc 등)
 _QUERY_FILTER_MAP: dict[str, list[str]] = {
     'btc':      ['bitcoin', 'btc'],
     'bitcoin':  ['bitcoin', 'btc'],
@@ -47,6 +65,8 @@ _QUERY_FILTER_MAP: dict[str, list[str]] = {
     'xrp':      ['xrp', 'ripple'],
     'etf':      ['etf'],
     'sec':      ['sec', 'regulation', 'regulatory'],
+    'fed':      ['fed', 'fomc', 'powell', 'interest rate'],
+    'macro':    ['fed', 'fomc', 'cpi', 'ppi', 'inflation', 'nasdaq', 'recession'],
     'defi':     ['defi', 'decentralized finance'],
     'hack':     ['hack', 'exploit', 'breach', 'stolen'],
 }
@@ -64,24 +84,49 @@ _EXCLUDE_RE = [
         r'\bhow\s+to\s+(make|earn)\b',
         r'\b\d+[xX]\s+(returns?|gains?|profits?)\b',
         r'\b(shiba?\s+inu|dogecoin|doge)\s+(price|prediction|surge|pump)\b',
-        r'\b(all[\s-]time\s+high|ATH)\s+(incoming|coming|soon)\b',
         r'\bclick\s+(here|now)\b',
     ]
 ]
 
-# ── 우선순위 키워드 (앞 = 높은 가중치) ───────────────────────────────────────
+# ── 3-tier 우선순위 키워드 ────────────────────────────────────────────────────
+# Tier 1: 직접 크립토 이슈 (가중치 50~)
 
-_PRIORITY_KW = [
-    'ETF', 'SEC', 'CFTC', 'regulation', 'law', 'bill', 'congress', 'senate',
+_CRYPTO_SCORE_KW = [
+    'ETF', 'SEC', 'CFTC', 'regulation', 'bill', 'congress', 'senate', 'law',
     'hack', 'exploit', 'breach', 'stolen', 'vulnerability',
-    'BlackRock', 'Fidelity', 'MicroStrategy', 'institutional',
+    'BlackRock', 'Fidelity', 'MicroStrategy', 'institutional', 'fund',
     'Binance', 'Coinbase', 'Kraken', 'Upbit', 'Bybit', 'exchange',
-    'Layer2', 'L2', 'lightning', 'rollup', 'zkEVM',
-    'AI', 'DeFi', 'NFT', 'stablecoin',
-    'bitcoin', 'ethereum',
-    'on-chain', 'onchain', 'blockchain',
-    'global', 'policy', 'government',
+    'stablecoin', 'USDT', 'USDC',
+    'Layer2', 'L2', 'rollup', 'DeFi', 'NFT',
+    'bitcoin', 'ethereum', 'crypto', 'blockchain',
+    'on-chain', 'onchain',
 ]
+
+# Tier 2: 매크로 경제 이슈 (가중치 30~)
+_MACRO_SCORE_KW = [
+    'Fed', 'FOMC', 'Powell', 'Federal Reserve',
+    'interest rate', 'rate hike', 'rate cut', 'quantitative',
+    'CPI', 'PPI', 'inflation', 'deflation',
+    'unemployment', 'jobs', 'payroll', 'GDP',
+    'treasury', 'yield', 'bond',
+    'liquidity', 'recession', 'stagflation',
+]
+
+# Tier 3: 글로벌 리스크·증시 이슈 (가중치 15~)
+_GLOBAL_SCORE_KW = [
+    'Nasdaq', 'S&P', 'stock market', 'market crash', 'market rally',
+    'DXY', 'dollar', 'currency',
+    'tariff', 'trade war', 'sanctions',
+    'China', 'geopolitical', 'war', 'conflict',
+    'Nvidia', 'Tesla', 'AI stocks',
+    'oil', 'crude', 'energy',
+    'risk-on', 'risk-off', 'safe haven',
+    'global markets',
+]
+
+# 크립토 키워드 집합 (카테고리 분류용)
+_CRYPTO_KW_SET = {k.lower() for k in _CRYPTO_SCORE_KW}
+_MACRO_KW_SET  = {k.lower() for k in _MACRO_SCORE_KW}
 
 
 # ── 캐시 ──────────────────────────────────────────────────────────────────────
@@ -101,7 +146,7 @@ def _save_cache(cache: dict) -> None:
         with open(NEWS_CACHE_FILE, 'w', encoding='utf-8') as f:
             json.dump(pruned, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[NEWS DEDUPE] cache save error: {e}")
+        print(f"[DEDUPE] cache save error: {e}")
 
 
 def _url_key(url: str) -> str:
@@ -151,11 +196,11 @@ def _gnews_fetch(query: str, hours: int) -> list:
             if not title or not url_:
                 continue
             items.append({
-                'title':       title,
-                'url':         url_,
-                'source':      (a.get('source') or {}).get('name', ''),
+                'title':        title,
+                'url':          url_,
+                'source':       (a.get('source') or {}).get('name', ''),
                 'published_at': a.get('publishedAt', ''),
-                'description': (a.get('description') or '').strip(),
+                'description':  (a.get('description') or '').strip(),
             })
         return items
     except Exception as e:
@@ -170,7 +215,7 @@ def _rss_fetch(query: str, hours: int) -> list:
         print("[NEWS FETCH] feedparser not installed")
         return []
 
-    q = requests.utils.quote(query)
+    q       = requests.utils.quote(query)
     rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
     try:
         feed   = feedparser.parse(rss_url)
@@ -182,19 +227,17 @@ def _rss_fetch(query: str, hours: int) -> list:
             if pub_ts < cutoff:
                 continue
             title = entry.get('title', '')
-            # Google News RSS format: "Article Title - Source Name"
             if ' - ' in title:
                 title = title.rsplit(' - ', 1)[0].strip()
             url = entry.get('link', '')
             if not title or not url:
                 continue
-            desc = _clean_desc(entry.get('summary', ''))
             items.append({
-                'title':       title,
-                'url':         url,
-                'source':      (entry.get('source') or {}).get('title', ''),
+                'title':        title,
+                'url':          url,
+                'source':       (entry.get('source') or {}).get('title', ''),
                 'published_at': entry.get('published', ''),
-                'description': desc,
+                'description':  _clean_desc(entry.get('summary', '')),
             })
         return items
     except Exception as e:
@@ -203,30 +246,61 @@ def _rss_fetch(query: str, hours: int) -> list:
 
 
 def _fetch_all(hours: int) -> list:
-    seen_urls: set = set()
+    seen_urls: set  = set()
     all_items: list = []
     source = 'gnews' if GNEWS_API_KEY else 'rss'
-    for q in CRYPTO_QUERIES:
-        print(f"[NEWS FETCH] query='{q}' hours={hours} source={source}")
+
+    for q in _CRYPTO_QUERIES:
+        print(f"[CRYPTO NEWS] fetch query='{q}' hours={hours} source={source}")
         items = _gnews_fetch(q, hours) if GNEWS_API_KEY else _rss_fetch(q, hours)
         for item in items:
             url = item.get('url', '')
             if url and url not in seen_urls:
                 seen_urls.add(url)
                 all_items.append(item)
-    print(f"[NEWS FETCH] total_raw={len(all_items)}")
+
+    for q in _MACRO_QUERIES:
+        print(f"[MACRO NEWS] fetch query='{q}' hours={hours} source={source}")
+        items = _gnews_fetch(q, hours) if GNEWS_API_KEY else _rss_fetch(q, hours)
+        for item in items:
+            url = item.get('url', '')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_items.append(item)
+
+    print(f"[NEWS FETCH] total_raw={len(all_items)} (crypto_queries={len(_CRYPTO_QUERIES)} macro_queries={len(_MACRO_QUERIES)})")
     return all_items
 
 
 # ── 필터 ──────────────────────────────────────────────────────────────────────
 
+def _category(item: dict) -> str:
+    """항목을 crypto / macro / global 중 하나로 분류."""
+    text = (item['title'] + ' ' + item.get('description', '')).lower()
+    if any(kw in text for kw in _CRYPTO_KW_SET):
+        return 'crypto'
+    if any(kw in text for kw in _MACRO_KW_SET):
+        return 'macro'
+    return 'global'
+
+
 def _score(item: dict) -> int:
+    """3-tier 점수: 크립토(50+) > 매크로(30+) > 글로벌(15+)."""
     text = (item['title'] + ' ' + item.get('description', '')).lower()
     score = 0
-    for i, kw in enumerate(_PRIORITY_KW):
+    # Tier 1 — 직접 크립토
+    for i, kw in enumerate(_CRYPTO_SCORE_KW):
         if kw.lower() in text:
-            score += len(_PRIORITY_KW) - i
-    return score
+            score += 50 - i
+    # Tier 2 — 매크로 경제
+    for i, kw in enumerate(_MACRO_SCORE_KW):
+        if kw.lower() in text:
+            score += 30 - i
+    # Tier 3 — 글로벌 리스크
+    for i, kw in enumerate(_GLOBAL_SCORE_KW):
+        if kw.lower() in text:
+            score += 15 - i
+    return max(score, 0)
 
 
 def _filter_news(items: list) -> list:
@@ -238,16 +312,22 @@ def _filter_news(items: list) -> list:
         if any(p.search(title) for p in _EXCLUDE_RE):
             continue
         filtered.append(item)
-    print(f"[NEWS FILTER] before={len(items)} after={len(filtered)}")
+    crypto_cnt = sum(1 for i in filtered if _category(i) == 'crypto')
+    macro_cnt  = sum(1 for i in filtered if _category(i) == 'macro')
+    global_cnt = len(filtered) - crypto_cnt - macro_cnt
+    print(
+        f"[FILTER] before={len(items)} after={len(filtered)} "
+        f"(crypto={crypto_cnt} macro={macro_cnt} global={global_cnt})"
+    )
     return filtered
 
 
-# ── 중복 제거 (배치 내) ───────────────────────────────────────────────────────
+# ── 중복 제거 ─────────────────────────────────────────────────────────────────
 
 def _dedupe_within(items: list) -> list:
-    result: list = []
+    result: list      = []
     seen_titles: list = []
-    seen_urls: set = set()
+    seen_urls: set    = set()
     for item in items:
         url   = item['url']
         title = item['title']
@@ -258,7 +338,7 @@ def _dedupe_within(items: list) -> list:
         seen_urls.add(url)
         seen_titles.append(title)
         result.append(item)
-    print(f"[NEWS DEDUPE] within_batch: {len(items)} → {len(result)}")
+    print(f"[DEDUPE] within_batch: {len(items)} → {len(result)}")
     return result
 
 
@@ -272,7 +352,6 @@ def _translate_ko(text: str) -> str:
         translated = GoogleTranslator(source='auto', target='ko').translate(text[:500])
         if not translated:
             return text
-        # Strip zero-width and invisible Unicode chars
         translated = re.sub(r'[​‌‍⁠﻿]', '', translated)
         return translated.strip() or text
     except Exception:
@@ -282,11 +361,9 @@ def _translate_ko(text: str) -> str:
 def _clean_desc(raw: str) -> str:
     """HTML 태그·엔티티 제거, Google News RSS source suffix 제거."""
     text = re.sub(r'<[^>]+>', '', raw)
-    # &amp;nbsp; → space,  &nbsp; → space, etc.
     text = text.replace('&amp;nbsp;', ' ').replace('&nbsp;', ' ')
     text = text.replace('&amp;amp;', '&').replace('&amp;', '&')
     text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
-    # Google News RSS: "Article text&nbsp;&nbsp;Source Name - Date"
     text = re.sub(r'\s{2,}.{0,40}$', '', text)
     return re.sub(r'\s+', ' ', text).strip()
 
@@ -295,7 +372,6 @@ def _make_summary(item: dict) -> str:
     desc = _clean_desc(item.get('description', ''))
     if not desc:
         desc = item.get('title', '')
-    # Take first 2 sentences or up to 250 chars
     if len(desc) > 250:
         sentences = re.split(r'(?<=[.!?])\s+', desc)
         desc = ' '.join(sentences[:2])
@@ -318,7 +394,7 @@ def _build_briefing(items: list, period: str) -> str:
         return (
             f"{header}\n\n"
             "🐰 아슈 특파원 출동!\n"
-            "오늘은 큰 이슈가 없었쥐 😴"
+            "오늘은 큰 이슈가 없었슈 😴"
         )
 
     lines = [header, ""]
@@ -326,7 +402,7 @@ def _build_briefing(items: list, period: str) -> str:
         lines.append(f"📰 {item['title']}")
         lines.append(f"➡️ {item['_summary']}")
         lines.append("")
-        lines.append(f"🔗 링크:")
+        lines.append("🔗 링크:")
         lines.append(item['url'])
         lines.append("")
 
@@ -361,14 +437,21 @@ def get_crypto_news(
     for item in deduped:
         if use_cache and _is_cached(item, cache):
             continue
-        item['_score']   = _score(item)
-        item['_summary'] = _make_summary(item)
+        item['_score']    = _score(item)
+        item['_category'] = _category(item)
+        item['_summary']  = _make_summary(item)
         final.append(item)
 
     final.sort(key=lambda x: x['_score'], reverse=True)
     final = final[:max_items]
 
-    print(f"[NEWS DEDUPE] final_after_cache={len(final)} use_cache={use_cache}")
+    crypto_n = sum(1 for i in final if i.get('_category') == 'crypto')
+    macro_n  = sum(1 for i in final if i.get('_category') == 'macro')
+    global_n = len(final) - crypto_n - macro_n
+    print(
+        f"[DEDUPE] final={len(final)} use_cache={use_cache} "
+        f"(crypto={crypto_n} macro={macro_n} global={global_n})"
+    )
 
     if use_cache:
         for item in final:
@@ -385,13 +468,29 @@ def get_briefing(
     use_cache: bool = True,
     max_items: int = 10,
 ) -> str:
-    """뉴스 수집 + 포맷 합성 → Telegram 전송용 문자열 반환."""
+    """뉴스 수집 + 포맷 합성 → Telegram 전송용 문자열 반환.
+    5개 미만이면 hours를 48h로 자동 확대 후 재시도."""
     label = f" filter={query_filter}" if query_filter else ""
-    print(f"[NEWS TEST] get_briefing period={period} hours={hours} max={max_items}{label}")
+    print(
+        f"[NEWS TEST] get_briefing period={period} hours={hours} "
+        f"max={max_items}{label}"
+    )
+
     items = get_crypto_news(
         hours=hours,
         max_items=max_items,
         query_filter=query_filter,
         use_cache=use_cache,
     )
+
+    # 5개 미만이면 48시간으로 자동 확대
+    if len(items) < 5 and hours < 48:
+        print(f"[NEWS FETCH] only {len(items)} items, retrying with hours=48")
+        items = get_crypto_news(
+            hours=48,
+            max_items=max_items,
+            query_filter=query_filter,
+            use_cache=use_cache,
+        )
+
     return _build_briefing(items, period)
