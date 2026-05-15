@@ -5,6 +5,7 @@ API KEY 불필요.
 """
 
 import hashlib
+import html as _html
 import json
 import re
 import time
@@ -433,24 +434,30 @@ def _build_briefing(items: list, period: str) -> str:
     message = f"{header}\n\n"
 
     for idx, item in enumerate(items):
-        title   = (item.get('title')    or '').strip()
-        summary = (item.get('_summary') or '').strip()
-        url     = (item.get('url')      or '').strip()
-        print(f"[ITEM {idx}] title={title[:60]!r} summary_len={len(summary)} url={'Y' if url else 'N'}")
+        title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
+        summary  = (item.get('_summary') or '').strip()
+        url      = (item.get('url')      or '').strip()
+        print(f"[ITEM {idx}] title_ko={title_ko[:50]!r} summary_len={len(summary)} url={'Y' if url else 'N'}")
 
-        if not title:
+        if not title_ko:
             print(f"[ITEM {idx}] SKIP — title empty")
             continue
 
-        message += f"📰 {title}\n"
-
-        if summary:
-            message += f"➡️ {summary}\n\n"
-        else:
-            message += "\n"
+        # HTML escape (제목·요약 텍스트만, URL은 href 속성으로 별도 처리)
+        safe_title   = _html.escape(title_ko)
+        safe_summary = _html.escape(summary)
+        # href 안의 & → &amp; 처리
+        safe_url = url.replace('&', '&amp;')
 
         if url:
-            message += f"🔗 링크:\n{url}\n\n"
+            message += f'📰 <a href="{safe_url}">{safe_title}</a>\n'
+        else:
+            message += f'📰 {safe_title}\n'
+
+        if summary:
+            message += f'➡️ {safe_summary}\n\n'
+        else:
+            message += '\n'
 
         print(f"[MESSAGE LEN] {len(message)}")
 
@@ -517,11 +524,15 @@ def get_crypto_news(
     candidates.sort(key=lambda x: x['_score'], reverse=True)
     final = candidates[:max_items]
 
-    # Step 3: 상위 N개만 번역
+    # Step 3: 상위 N개만 번역 (제목 + 요약)
     print(f"[RSS FINAL] count={len(final)} (번역 시작)")
     for item in final:
+        # 요약 번역
         raw_sum = _make_summary(item)
         item['_summary'] = raw_sum.strip() if raw_sum.strip() else item['title']
+        # 제목 번역 (HTML 링크 텍스트용)
+        title_ko = _translate_ko(item['title'])
+        item['_title_ko'] = title_ko.strip() if title_ko and title_ko.strip() else item['title']
 
     # 최종 로그
     crypto_n = sum(1 for i in final if i.get('_category') == 'crypto')

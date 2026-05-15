@@ -1973,6 +1973,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=chunk,
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         print(f"[NEWS SEND] {period} briefing sent OK")
@@ -2018,7 +2019,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"[TELEGRAM NEWS SEND] len={len(text)} is_empty_msg={is_empty} chat_id={chat_id}")
     print(text[:1000])
     for chunk in _split_message(text):
-        await update.message.reply_text(chunk, disable_web_page_preview=True)
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
     print(f"[NEWS SEND] /news{label} sent OK")
 
 
