@@ -2014,12 +2014,17 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
     is_empty = "없었슈" in text
-    print(f"[TELEGRAM NEWS SEND] len={len(text)} is_empty_msg={is_empty} chat_id={chat_id}")
-    print(text[:1000])
+    has_html = "<a href=" in text or "<b>" in text
+    print(f"[TELEGRAM NEWS SEND] len={len(text)} is_empty={is_empty} has_html={has_html} parse_mode=HTML")
+    print(text[:1200])
     for chunk in _split_message(text):
-        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+        await update.message.reply_text(
+            chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
     print(f"[NEWS SEND] /news{label} sent OK")
 
 

@@ -431,28 +431,33 @@ def _build_briefing(items: list, period: str) -> str:
             "오늘은 큰 이슈가 없었슈 😴"
         )
 
-    message = f"{header}\n\n"
+    # 헤더 bold 처리
+    message = f"<b>{_html.escape(header)}</b>\n\n"
 
     for idx, item in enumerate(items):
-        title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
-        summary  = (item.get('_summary') or '').strip()
-        url      = (item.get('url')      or '').strip()
-        print(f"[ITEM {idx}] title_ko={title_ko[:50]!r} summary_len={len(summary)} url={'Y' if url else 'N'}")
+        title_raw = (item.get('title')    or '').strip()
+        title_ko  = (item.get('_title_ko') or title_raw).strip()
+        summary   = (item.get('_summary') or '').strip()
+        url       = (item.get('url')      or '').strip()
+
+        # 번역 결과 확인 로그
+        print(f"[FORMAT TITLE RAW] {title_raw[:60]}")
+        print(f"[FORMAT TITLE KO]  {title_ko[:60]}")
+        print(f"[ITEM {idx}] summary_len={len(summary)} url={'Y' if url else 'N'}")
 
         if not title_ko:
             print(f"[ITEM {idx}] SKIP — title empty")
             continue
 
-        # HTML escape (제목·요약 텍스트만, URL은 href 속성으로 별도 처리)
+        # HTML escape (텍스트만, URL href 별도 처리)
         safe_title   = _html.escape(title_ko)
         safe_summary = _html.escape(summary)
-        # href 안의 & → &amp; 처리
-        safe_url = url.replace('&', '&amp;')
+        safe_url     = url.replace('&', '&amp;')
 
         if url:
-            message += f'📰 <a href="{safe_url}">{safe_title}</a>\n'
+            message += f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n'
         else:
-            message += f'📰 {safe_title}\n'
+            message += f'📰 <b>{safe_title}</b>\n'
 
         if summary:
             message += f'➡️ {safe_summary}\n\n'
