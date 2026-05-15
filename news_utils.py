@@ -554,13 +554,28 @@ def _build_briefing(items: list, period: str) -> str:
         )
 
     message = f"{header}\n\n"
-    for article in items:
-        message += f"📰 {article['title']}\n"
-        message += f"➡️ {article['_summary']}\n\n"
-        message += f"🔗 링크:\n{article['url']}\n\n"
 
-    message = message.rstrip()
-    print(f"[NEWS FINAL] message_length={len(message)} news_count={len(items)}")
+    for item in items:
+        title   = (item.get('title')    or '').strip()
+        summary = (item.get('_summary') or '').strip()
+        url     = (item.get('url')      or '').strip()
+
+        if not title:
+            continue
+
+        message += f"📰 {title}\n"
+
+        if summary:
+            message += f"➡️ {summary}\n\n"
+        else:
+            message += "\n"
+
+        if url:
+            message += f"🔗 링크:\n{url}\n\n"
+
+    print("[NEWS MESSAGE]")
+    print(message[:3000])
+    print(f"[BUILD RESULT] len={len(message)}")
     return message
 
 
