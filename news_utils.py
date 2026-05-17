@@ -732,10 +732,12 @@ def _normalize_headline(title: str) -> str:
     return result
 
 
-def _compress_title(title_ko: str) -> str:
-    """제목 → 28자 이내 뉴스 헤드라인 스타일."""
+def _compress_title(title_ko: str, max_len: int = 20) -> str:
+    """태그/filler 제거 후 단순 truncate. max_len 초과 시 '...' 붙임."""
     result = _normalize_headline(title_ko)
-    return _natural_cut(result, 28)
+    if len(result) > max_len:
+        return result[:max_len] + "..."
+    return result
 
 
 def _compress_summary(summary_ko: str) -> str:
@@ -787,22 +789,31 @@ def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
 
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
+    def _fmt_item(item: dict) -> str:
+        title = (item.get('_title_ko') or item.get('title') or '').strip()
+        url   = (item.get('url') or '').strip()
+        if not title:
+            return ''
+        safe_title = _html.escape(title)
+        safe_url   = url.replace('&', '&amp;')
+        if url:
+            return f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n'
+        return f'📰 <b>{safe_title}</b>\n'
+
     # 해외 뉴스
     message += "🌎 <b>해외 뉴스</b>\n"
     for idx, item in enumerate(intl_items):
-        title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
-        print(f"[FORMAT INTL {idx}] {title_ko[:50]}")
-        if title_ko:
-            message += f"📰 {_html.escape(title_ko)}\n"
+        line = _fmt_item(item)
+        print(f"[FORMAT INTL {idx}] {(item.get('_title_ko') or '')[:50]}")
+        message += line
 
     # 국내 뉴스
     if kr_items:
         message += "\n🇰🇷 <b>국내 뉴스</b>\n"
         for idx, item in enumerate(kr_items):
-            title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
-            print(f"[FORMAT KR {idx}] {title_ko[:50]}")
-            if title_ko:
-                message += f"📰 {_html.escape(title_ko)}\n"
+            line = _fmt_item(item)
+            print(f"[FORMAT KR {idx}] {(item.get('_title_ko') or '')[:50]}")
+            message += line
 
     print(f"[RETURN MESSAGE] len={len(message)}")
     return message.rstrip()
