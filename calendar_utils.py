@@ -521,31 +521,30 @@ def build_calendar_message(is_test: bool = False) -> str:
                 print(f"[GC FINAL] no today/tomorrow → fallback to +{delta}d ({extra_date})")
                 break
 
-    # 이벤트 없으면 종료
-    if not today_events and not tomorrow_events and not extra_events:
-        return (
-            f"<b>{_html.escape(header)}</b>\n\n"
-            "📭 이번 주 주요 경제 일정이 없습니다."
-        )
-
     total_final = len(today_events) + len(tomorrow_events) + len(extra_events)
     print(f"[GC FINAL] total_shown={total_final}")
 
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
+    # 오늘 섹션 — 항상 출력
+    message += "📅 <b>오늘 일정</b>\n\n"
     if today_events:
-        message += "📅 <b>오늘 일정</b>\n\n"
         message += _format_day_section(today_events)
+    else:
+        message += "오늘 일정 없슈 😴\n"
 
-    if today_events and (tomorrow_events or extra_events):
-        message += "---\n\n"
+    message += "\n---\n\n"
 
+    # 내일 섹션 — 항상 출력
+    message += "📅 <b>내일 일정</b>\n\n"
     if tomorrow_events:
-        message += "📅 <b>내일 일정</b>\n\n"
         message += _format_day_section(tomorrow_events)
+    else:
+        message += "내일 일정 없슈 😴\n"
 
+    # 오늘+내일 모두 비었을 때만 추가 fallback 섹션 표시
     if extra_events:
-        message += f"📅 <b>{_html.escape(extra_label)}</b>\n\n"
+        message += f"\n---\n\n📅 <b>{_html.escape(extra_label)}</b>\n\n"
         message += _format_day_section(extra_events)
 
     return message.rstrip()
