@@ -26,32 +26,50 @@ _UA = (
 )
 _HEADERS = {"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9"}
 
-# ── RSS 소스 (무료, API 불필요) ───────────────────────────────────────────────
+# ── 해외 RSS 소스 (무료, API 불필요) ─────────────────────────────────────────
 
 _RSS_SOURCES = {
-    "CoinDesk":      "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "Cointelegraph": "https://cointelegraph.com/rss",
-    "Decrypt":       "https://decrypt.co/feed",
-    "The Block":     "https://www.theblock.co/rss.xml",
-    "Yahoo Finance": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=BTC-USD&region=US&lang=en-US",
+    "CoinDesk":       "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Cointelegraph":  "https://cointelegraph.com/rss",
+    "Decrypt":        "https://decrypt.co/feed",
+    "The Block":      "https://www.theblock.co/rss.xml",
+    "NYTimes Biz":    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    "NYTimes Economy":"https://rss.nytimes.com/services/xml/rss/nyt/Economy.xml",
+    "CNN Business":   "http://rss.cnn.com/rss/edition_business.rss",
 }
 
 # ── 한국 뉴스 RSS 소스 ────────────────────────────────────────────────────────
 
 _KOREAN_RSS_SOURCES = {
-    "연합뉴스":  "https://www.yna.co.kr/RSS/economy.xml",
-    "한국경제":  "https://www.hankyung.com/feed/economy",
-    "매일경제":  "https://news.mk.co.kr/rss/40300001.xml",
-    "조선비즈":  "https://biz.chosun.com/rss/site.html",
-    "SBS경제":   "https://news.sbs.co.kr/news/RSS.xml",
-    "뉴시스":    "https://www.newsis.com/RSS/finance.xml",
+    "조선일보":   "https://www.chosun.com/arc/outboundfeeds/rss/category/economy/?outputType=xml",
+    "동아일보":   "https://rss.donga.com/total.xml",
+    "중앙일보":   "https://rss.joins.com/joins_news_list.xml",
+    "매일경제":   "https://www.mk.co.kr/rss/30000001.xml",
+    "한국경제":   "https://www.hankyung.com/feed/economy",
+    "경향신문":   "https://www.khan.co.kr/rss/khan_economy.xml",
+    "한겨레":     "https://www.hani.co.kr/rss/",
+    "연합뉴스TV": "https://www.yonhapnewstv.co.kr/add/rss",
+    "머니투데이": "https://www.mt.co.kr/rss/news/rank_news.xml",
+    "뉴시스":     "https://www.newsis.com/RSS/finance.xml",
+    "SBS":        "https://news.sbs.co.kr/news/rss.do",
+    "JTBC":       "https://news.jtbc.joins.com/Etc/RssService.aspx",
 }
 
-_KO_CRYPTO_KW = [
+# ── 국내 뉴스 키워드 (경제 + 정책 + 코인 전체) ───────────────────────────────
+
+_KO_KW = [
+    # 거시/경제
+    '부동산', '금리', '기준금리', '한국은행', '환율', '코스피', '코스닥',
+    '수출', '반도체', '인플레', '긴축', '경기',
+    # 글로벌 (영문 포함)
+    'Fed', 'CPI', 'PPI', '나스닥', '미국 증시', '미 증시', '뉴욕',
+    # 크립토/디지털자산
     '비트코인', '이더리움', '코인', '업비트', '빗썸', '코빗', '코인원',
     '디지털자산', '가상자산', 'ETF', '암호화폐', '블록체인',
     '바이낸스', '솔라나', '리플', '도지', '스테이블코인', '디파이',
     '크립토', '채굴', '해킹', '가상화폐',
+    # 기업/기술
+    'AI', '삼성', 'SK하이닉스', '현대차',
 ]
 
 # ── Google News RSS 키워드 ────────────────────────────────────────────────────
@@ -241,7 +259,7 @@ def _fetch_rss_sources(hours: int) -> list:
             per_source[source_name] = 0
 
     src_str = ' '.join(f"{k}={v}" for k, v in per_source.items())
-    print(f"[RSS FETCH] {src_str} total={len(all_items)} hours={hours}")
+    print(f"[GLOBAL FETCH COUNT] {src_str} total={len(all_items)} hours={hours}")
     return all_items
 
 
@@ -309,10 +327,11 @@ def _fetch_korean_news(hours: int) -> list:
         print("[KO RSS FETCH] feedparser not installed")
         return []
 
-    cutoff     = time.time() - hours * 3600
+    cutoff      = time.time() - hours * 3600
     all_items: list = []
     seen_urls: set  = set()
     ko_headers  = {**_HEADERS, "Accept-Language": "ko-KR,ko;q=0.9"}
+    per_source: dict = {}
 
     for source_name, rss_url in _KOREAN_RSS_SOURCES.items():
         count = 0
@@ -320,6 +339,7 @@ def _fetch_korean_news(hours: int) -> list:
             feed = feedparser.parse(rss_url, request_headers=ko_headers)
             if not feed.entries:
                 print(f"[KO RSS FETCH] {source_name}: 0개 (empty or blocked)")
+                per_source[source_name] = 0
                 continue
             for entry in feed.entries:
                 pt     = entry.get('published_parsed') or entry.get('updated_parsed')
@@ -333,8 +353,8 @@ def _fetch_korean_news(hours: int) -> list:
                 desc = _clean_desc(
                     entry.get('summary') or entry.get('description') or ''
                 )
-                combined = (title + ' ' + desc).lower()
-                if not any(kw.lower() in combined for kw in _KO_CRYPTO_KW):
+                combined = title + ' ' + desc
+                if not any(kw in combined for kw in _KO_KW):
                     continue
                 seen_urls.add(url)
                 all_items.append({
@@ -347,11 +367,13 @@ def _fetch_korean_news(hours: int) -> list:
                     '_lang':        'ko',
                 })
                 count += 1
-            print(f"[KO RSS FETCH] {source_name}: {count}개")
+            per_source[source_name] = count
         except Exception as e:
             print(f"[KO RSS FETCH] {source_name} error: {e}")
+            per_source[source_name] = 0
 
-    print(f"[KO RSS FETCH] total={len(all_items)} hours={hours}")
+    src_str = ' '.join(f"{k}={v}" for k, v in per_source.items())
+    print(f"[DOMESTIC FETCH COUNT] {src_str} total={len(all_items)} hours={hours}")
     return all_items
 
 
@@ -438,7 +460,7 @@ def _dedupe_within(items: list) -> list:
         title = item['title']
         if url in seen_urls:
             continue
-        if any(fuzz.ratio(title, t) >= 80 for t in seen_titles):
+        if any(fuzz.ratio(title, t) >= 75 for t in seen_titles):
             continue
         seen_urls.add(url)
         seen_titles.append(title)
@@ -684,10 +706,35 @@ def _natural_cut(text: str, max_len: int) -> str:
     return text[:max_len]
 
 
+# 제목 앞 태그 ([단독], [속보] 등)
+_HEADLINE_TAG_RE = re.compile(
+    r'^[\[【〔(]?\s*(?:단독|속보|종합|긴급|특보|포토|영상|LIVE|UPDATE)\s*[\]】〕)]?\s*[|:·▶]?\s*',
+    re.IGNORECASE,
+)
+# 제목 뒤 출처 " - 매일경제", " | 연합뉴스" 등
+_HEADLINE_SOURCE_RE = re.compile(
+    r'\s*[-–—|]\s*[\w가-힣]{2,10}(?:뉴스|일보|경제|투데이|미디어|TV|방송|신문)?\s*$',
+)
+# useless 도입부 패턴 ("오늘 코인 시장에서...")
+_HEADLINE_FILLER_RE = re.compile(
+    r'^(?:오늘|이번\s*주|최신|주요)\s*(?:암호화폐|코인|뉴스|이슈|소식|시장)\s*(?:업계에서|관련|브리핑|동향)?[,\s]*',
+    re.IGNORECASE,
+)
+
+
+def _normalize_headline(title: str) -> str:
+    """헤드라인 정규화: 태그·출처·filler 제거 → verbose 서술어 제거."""
+    result = title.strip()
+    result = _HEADLINE_TAG_RE.sub('', result).strip()
+    result = _HEADLINE_SOURCE_RE.sub('', result).strip()
+    result = _HEADLINE_FILLER_RE.sub('', result).strip()
+    result = _strip_verbose(result)
+    return result
+
+
 def _compress_title(title_ko: str) -> str:
-    """제목 → 28자 이내 뉴스 헤드라인 스타일.
-    조사 유지, verbose 서술어 제거, '...' 없음."""
-    result = _strip_verbose(title_ko)
+    """제목 → 28자 이내 뉴스 헤드라인 스타일."""
+    result = _normalize_headline(title_ko)
     return _natural_cut(result, 28)
 
 
@@ -833,15 +880,14 @@ def get_crypto_news(
     src_rss  = sum(1 for i in final if i.get('_source') == 'rss')
     src_gn   = sum(1 for i in final if i.get('_source') == 'google')
     print(
-        f"[RSS FINAL] final={len(final)} "
+        f"[GLOBAL FINAL] final={len(final)} "
         f"src(rss={src_rss} google={src_gn}) "
         f"cat(crypto={crypto_n} macro={macro_n} global={global_n})"
     )
     for i, item in enumerate(final, 1):
         print(
-            f"[RSS FINAL] [{i}] score={item['_score']} "
+            f"[GLOBAL FINAL] [{i}] score={item['_score']} "
             f"src={item.get('_source','?')} "
-            f"summary_len={len(item.get('_summary',''))} "
             f"title={item['title'][:55]}"
         )
 
@@ -876,9 +922,10 @@ def get_domestic_news(
         candidates = list(deduped)
 
     final = candidates[:max_items]
-    print(f"[KO FINAL] count={len(final)} (제목 압축 시작)")
-    for item in final:
+    print(f"[DOMESTIC FINAL] count={len(final)} (제목 압축 시작)")
+    for i, item in enumerate(final, 1):
         item['_title_ko'] = _compress_title(item['title'])
+        print(f"[DOMESTIC FINAL] [{i}] src={item.get('source','?')} title={item['title'][:45]}")
 
     if use_cache:
         for item in final:
