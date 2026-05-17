@@ -1984,9 +1984,13 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/news [btc|eth|sol|...] → 최신 크립토 뉴스 즉시 출력 (테스트 모드)."""
+    """/news [btc|eth|sol|...] → 최신 뉴스 브리핑 (관리자 전용)."""
     print("[CMD_NEWS REAL HANDLER]")
     if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await update.message.reply_text("권한이 없습니다.")
         return
 
     query_filter: str | None = context.args[0].lower() if context.args else None

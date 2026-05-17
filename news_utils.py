@@ -732,12 +732,20 @@ def _normalize_headline(title: str) -> str:
     return result
 
 
-def _compress_title(title_ko: str, max_len: int = 20) -> str:
-    """태그/filler 제거 후 단순 truncate. max_len 초과 시 '...' 붙임."""
+def smart_truncate(text: str, limit: int = 23) -> str:
+    """단어(어절) 단위로 자연스럽게 자름. 중간 글자 절단 금지."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if ' ' in cut:
+        cut = cut.rsplit(' ', 1)[0]
+    return cut.strip() + '...'
+
+
+def _compress_title(title_ko: str) -> str:
+    """태그/filler 제거 후 smart_truncate."""
     result = _normalize_headline(title_ko)
-    if len(result) > max_len:
-        return result[:max_len] + "..."
-    return result
+    return smart_truncate(result, 23)
 
 
 def _compress_summary(summary_ko: str) -> str:
@@ -773,11 +781,13 @@ def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
     print(f"[BUILD_BRIEFING START] intl={len(intl_items)} kr={len(kr_items)} period={period}")
 
     if period == 'morning':
-        header = "🐰 아슈 특파원 아침 출동"
+        header = "🐰 아슈 특파원 오전 출동"
+    elif period == 'evening':
+        header = "🐰 아슈 특파원 오후 출동"
     elif period == 'test':
         header = "🐰 아슈 특파원 테스트 출동"
     else:
-        header = "🐰 아슈 특파원 저녁 출동"
+        header = "🐰 아슈 특파원 오후 출동"
 
     if not intl_items and not kr_items:
         print("[EMPTY BRANCH TRIGGERED]")
