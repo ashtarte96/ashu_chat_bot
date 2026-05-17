@@ -36,6 +36,24 @@ _RSS_SOURCES = {
     "Yahoo Finance": "https://feeds.finance.yahoo.com/rss/2.0/headline?s=BTC-USD&region=US&lang=en-US",
 }
 
+# ── 한국 뉴스 RSS 소스 ────────────────────────────────────────────────────────
+
+_KOREAN_RSS_SOURCES = {
+    "연합뉴스":  "https://www.yna.co.kr/RSS/economy.xml",
+    "한국경제":  "https://www.hankyung.com/feed/economy",
+    "매일경제":  "https://news.mk.co.kr/rss/40300001.xml",
+    "조선비즈":  "https://biz.chosun.com/rss/site.html",
+    "SBS경제":   "https://news.sbs.co.kr/news/RSS.xml",
+    "뉴시스":    "https://www.newsis.com/RSS/finance.xml",
+}
+
+_KO_CRYPTO_KW = [
+    '비트코인', '이더리움', '코인', '업비트', '빗썸', '코빗', '코인원',
+    '디지털자산', '가상자산', 'ETF', '암호화폐', '블록체인',
+    '바이낸스', '솔라나', '리플', '도지', '스테이블코인', '디파이',
+    '크립토', '채굴', '해킹', '가상화폐',
+]
+
 # ── Google News RSS 키워드 ────────────────────────────────────────────────────
 
 _GOOGLE_QUERIES = [
@@ -279,6 +297,61 @@ def _fetch_google_news(hours: int) -> list:
                 all_items.append(item)
 
     print(f"[RSS FETCH] Google queries={len(_GOOGLE_QUERIES)} total={len(all_items)} hours={hours}")
+    return all_items
+
+
+# ── Source 3: Korean News RSS ─────────────────────────────────────────────────
+
+def _fetch_korean_news(hours: int) -> list:
+    try:
+        import feedparser
+    except ImportError:
+        print("[KO RSS FETCH] feedparser not installed")
+        return []
+
+    cutoff     = time.time() - hours * 3600
+    all_items: list = []
+    seen_urls: set  = set()
+    ko_headers  = {**_HEADERS, "Accept-Language": "ko-KR,ko;q=0.9"}
+
+    for source_name, rss_url in _KOREAN_RSS_SOURCES.items():
+        count = 0
+        try:
+            feed = feedparser.parse(rss_url, request_headers=ko_headers)
+            if not feed.entries:
+                print(f"[KO RSS FETCH] {source_name}: 0개 (empty or blocked)")
+                continue
+            for entry in feed.entries:
+                pt     = entry.get('published_parsed') or entry.get('updated_parsed')
+                pub_ts = time.mktime(pt) if pt else time.time()
+                if pub_ts < cutoff:
+                    continue
+                title = (entry.get('title') or '').strip()
+                url   = entry.get('link', '')
+                if not title or not url or url in seen_urls:
+                    continue
+                desc = _clean_desc(
+                    entry.get('summary') or entry.get('description') or ''
+                )
+                combined = (title + ' ' + desc).lower()
+                if not any(kw.lower() in combined for kw in _KO_CRYPTO_KW):
+                    continue
+                seen_urls.add(url)
+                all_items.append({
+                    'title':        title,
+                    'url':          url,
+                    'source':       source_name,
+                    'published_at': entry.get('published', ''),
+                    'description':  desc,
+                    '_source':      'rss',
+                    '_lang':        'ko',
+                })
+                count += 1
+            print(f"[KO RSS FETCH] {source_name}: {count}개")
+        except Exception as e:
+            print(f"[KO RSS FETCH] {source_name} error: {e}")
+
+    print(f"[KO RSS FETCH] total={len(all_items)} hours={hours}")
     return all_items
 
 
@@ -612,10 +685,10 @@ def _natural_cut(text: str, max_len: int) -> str:
 
 
 def _compress_title(title_ko: str) -> str:
-    """제목 → 38자 이내 뉴스 헤드라인 스타일.
+    """제목 → 28자 이내 뉴스 헤드라인 스타일.
     조사 유지, verbose 서술어 제거, '...' 없음."""
     result = _strip_verbose(title_ko)
-    return _natural_cut(result, 38)
+    return _natural_cut(result, 28)
 
 
 def _compress_summary(summary_ko: str) -> str:
@@ -647,8 +720,8 @@ def summarize_korean_news(title_ko: str, summary_ko: str) -> tuple[str, str]:
 
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
-def _build_briefing(items: list, period: str) -> str:
-    print(f"[BUILD_BRIEFING START] items={len(items)} period={period}")
+def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
+    print(f"[BUILD_BRIEFING START] intl={len(intl_items)} kr={len(kr_items)} period={period}")
 
     if period == 'morning':
         header = "🐰 아슈 특파원 아침 출동"
@@ -657,7 +730,7 @@ def _build_briefing(items: list, period: str) -> str:
     else:
         header = "🐰 아슈 특파원 저녁 출동"
 
-    if len(items) == 0:
+    if not intl_items and not kr_items:
         print("[EMPTY BRANCH TRIGGERED]")
         return (
             f"{header}\n\n"
@@ -665,30 +738,26 @@ def _build_briefing(items: list, period: str) -> str:
             "오늘은 큰 이슈가 없었슈 😴"
         )
 
-    print("[HEADLINE ONLY MODE ENABLED]")
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
-    for idx, item in enumerate(items):
-        title_raw = (item.get('title')    or '').strip()
-        title_ko  = (item.get('_title_ko') or title_raw).strip()
-        url       = (item.get('url')      or '').strip()
+    # 해외 뉴스
+    message += "🌎 <b>해외 뉴스</b>\n"
+    for idx, item in enumerate(intl_items):
+        title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
+        print(f"[FORMAT INTL {idx}] {title_ko[:50]}")
+        if title_ko:
+            message += f"📰 {_html.escape(title_ko)}\n"
 
-        print(f"[FORMAT TITLE RAW] {title_raw[:60]}")
-        print(f"[FORMAT TITLE KO]  {title_ko[:60]}")
+    # 국내 뉴스
+    if kr_items:
+        message += "\n🇰🇷 <b>국내 뉴스</b>\n"
+        for idx, item in enumerate(kr_items):
+            title_ko = (item.get('_title_ko') or item.get('title') or '').strip()
+            print(f"[FORMAT KR {idx}] {title_ko[:50]}")
+            if title_ko:
+                message += f"📰 {_html.escape(title_ko)}\n"
 
-        if not title_ko:
-            print(f"[ITEM {idx}] SKIP — title empty")
-            continue
-
-        safe_title = _html.escape(title_ko)
-        safe_url   = url.replace('&', '&amp;')
-
-        if url:
-            message += f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n\n'
-        else:
-            message += f'📰 <b>{safe_title}</b>\n\n'
-
-    print(f"[RETURN MESSAGE] len={len(message)} items={len(items)}")
+    print(f"[RETURN MESSAGE] len={len(message)}")
     return message.rstrip()
 
 
@@ -754,7 +823,7 @@ def get_crypto_news(
     for item in final:
         title_ko = _translate_ko(item['title'])
         title_ko = title_ko.strip() if title_ko and title_ko.strip() else item['title']
-        # 헤드라인 스타일 압축 (38자 이내)
+        # 헤드라인 스타일 압축 (28자 이내)
         item['_title_ko'] = _compress_title(title_ko)
 
     # 최종 로그
@@ -784,6 +853,41 @@ def get_crypto_news(
     return final
 
 
+def get_domestic_news(
+    hours: int = 24,
+    max_items: int = 5,
+    use_cache: bool = True,
+) -> list:
+    """한국 RSS 수집 → 크립토 키워드 필터 → 중복제거 → 상위 N개."""
+    raw     = _fetch_korean_news(hours)
+    deduped = _dedupe_within(raw)
+
+    cache         = _load_cache()
+    cache_skipped = 0
+    candidates: list = []
+    for item in deduped:
+        if use_cache and _is_cached(item, cache):
+            cache_skipped += 1
+            continue
+        candidates.append(item)
+
+    if use_cache and len(candidates) < 3 and cache_skipped > 0:
+        print(f"[KO DEDUPE] candidates < 3 → cache bypass")
+        candidates = list(deduped)
+
+    final = candidates[:max_items]
+    print(f"[KO FINAL] count={len(final)} (제목 압축 시작)")
+    for item in final:
+        item['_title_ko'] = _compress_title(item['title'])
+
+    if use_cache:
+        for item in final:
+            _add_to_cache(item, cache)
+        _save_cache(cache)
+
+    return final
+
+
 def get_briefing(
     hours: int,
     period: str,
@@ -791,28 +895,32 @@ def get_briefing(
     use_cache: bool = True,
     max_items: int = 10,
 ) -> str:
-    """RSS 수집 + 포맷. 부족 시 12h → 24h → 48h 자동 확대."""
+    """RSS 수집 + 포맷. 해외 5개 + 국내 5개 듀얼 섹션."""
     label = f" filter={query_filter}" if query_filter else ""
     print(
         f"[RSS FETCH] get_briefing period={period} hours={hours} "
         f"max={max_items}{label} use_cache={use_cache}"
     )
 
-    items: list = []
+    intl_items: list = []
     for try_hours in _expand_hours(hours):
-        items = get_crypto_news(
-            hours=try_hours, max_items=max_items,
+        intl_items = get_crypto_news(
+            hours=try_hours, max_items=5,
             query_filter=query_filter, use_cache=use_cache,
         )
-        print(f"[RSS FINAL] try_hours={try_hours} → count={len(items)}")
-        if len(items) >= 1:
-            if try_hours != hours:
-                print(f"[RSS FETCH] hours={hours} 부족 → hours={try_hours} 사용")
+        print(f"[RSS FINAL] intl try_hours={try_hours} → count={len(intl_items)}")
+        if len(intl_items) >= 1:
             break
-        print(f"[RSS FETCH] hours={try_hours} → 0개, 범위 확대")
 
-    print(f"[CALL BUILD_BRIEFING] items={len(items)}")
-    return _build_briefing(items, period)
+    kr_items: list = []
+    for try_hours in _expand_hours(hours):
+        kr_items = get_domestic_news(hours=try_hours, max_items=5, use_cache=use_cache)
+        print(f"[RSS FINAL] kr try_hours={try_hours} → count={len(kr_items)}")
+        if len(kr_items) >= 1:
+            break
+
+    print(f"[CALL BUILD_BRIEFING] intl={len(intl_items)} kr={len(kr_items)}")
+    return _build_briefing(intl_items, kr_items, period)
 
 
 def _expand_hours(hours: int) -> list:
