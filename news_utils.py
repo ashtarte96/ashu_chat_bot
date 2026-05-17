@@ -612,10 +612,10 @@ def _natural_cut(text: str, max_len: int) -> str:
 
 
 def _compress_title(title_ko: str) -> str:
-    """제목 → 45자 이내 뉴스 헤드라인 스타일.
+    """제목 → 38자 이내 뉴스 헤드라인 스타일.
     조사 유지, verbose 서술어 제거, '...' 없음."""
     result = _strip_verbose(title_ko)
-    return _natural_cut(result, 45)
+    return _natural_cut(result, 38)
 
 
 def _compress_summary(summary_ko: str) -> str:
@@ -665,45 +665,31 @@ def _build_briefing(items: list, period: str) -> str:
             "오늘은 큰 이슈가 없었슈 😴"
         )
 
-    # 헤더 bold 처리
+    print("[HEADLINE ONLY MODE ENABLED]")
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
     for idx, item in enumerate(items):
         title_raw = (item.get('title')    or '').strip()
         title_ko  = (item.get('_title_ko') or title_raw).strip()
-        summary   = (item.get('_summary') or '').strip()
         url       = (item.get('url')      or '').strip()
 
-        # 번역 결과 확인 로그
         print(f"[FORMAT TITLE RAW] {title_raw[:60]}")
         print(f"[FORMAT TITLE KO]  {title_ko[:60]}")
-        print(f"[ITEM {idx}] summary_len={len(summary)} url={'Y' if url else 'N'}")
 
         if not title_ko:
             print(f"[ITEM {idx}] SKIP — title empty")
             continue
 
-        # HTML escape (텍스트만, URL href 별도 처리)
-        safe_title   = _html.escape(title_ko)
-        safe_summary = _html.escape(summary)
-        safe_url     = url.replace('&', '&amp;')
+        safe_title = _html.escape(title_ko)
+        safe_url   = url.replace('&', '&amp;')
 
         if url:
-            message += f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n'
+            message += f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n\n'
         else:
-            message += f'📰 <b>{safe_title}</b>\n'
+            message += f'📰 <b>{safe_title}</b>\n\n'
 
-        if summary:
-            message += f'➡️ {safe_summary}\n\n'
-        else:
-            message += '\n'
-
-        print(f"[MESSAGE LEN] {len(message)}")
-
-    print("[NEWS MESSAGE]")
-    print(message[:3000])
-    print(f"[RETURN MESSAGE] len={len(message)}")
-    return message
+    print(f"[RETURN MESSAGE] len={len(message)} items={len(items)}")
+    return message.rstrip()
 
 
 # ── 공개 API ──────────────────────────────────────────────────────────────────
@@ -763,19 +749,13 @@ def get_crypto_news(
     candidates.sort(key=lambda x: x['_score'], reverse=True)
     final = candidates[:max_items]
 
-    # Step 3: 상위 N개만 번역 (제목 + 요약)
-    print(f"[RSS FINAL] count={len(final)} (번역 시작)")
+    # Step 3: 상위 N개 제목만 번역 (요약 불필요, 헤드라인 전용)
+    print(f"[RSS FINAL] count={len(final)} (제목 번역 시작)")
     for item in final:
-        # 요약 번역
-        raw_sum = _make_summary(item)
-        item['_summary'] = raw_sum.strip() if raw_sum.strip() else item['title']
-        # 제목 번역 (HTML 링크 텍스트용)
         title_ko = _translate_ko(item['title'])
-        item['_title_ko'] = title_ko.strip() if title_ko and title_ko.strip() else item['title']
-        # 제목·요약 헤드라인 스타일 압축
-        item['_title_ko'], item['_summary'] = summarize_korean_news(
-            item['_title_ko'], item['_summary']
-        )
+        title_ko = title_ko.strip() if title_ko and title_ko.strip() else item['title']
+        # 헤드라인 스타일 압축 (38자 이내)
+        item['_title_ko'] = _compress_title(title_ko)
 
     # 최종 로그
     crypto_n = sum(1 for i in final if i.get('_category') == 'crypto')

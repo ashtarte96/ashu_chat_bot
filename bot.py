@@ -1967,7 +1967,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"[NEWS SEND] {period} briefing → chat_id={chat_id} hours={hours}")
     try:
         text = await asyncio.to_thread(
-            news_utils.get_briefing, hours, period, None, True
+            news_utils.get_briefing, hours, period, None, True, 8
         )
         for chunk in _split_message(text):
             await context.bot.send_message(
@@ -2003,7 +2003,7 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             'test',       # 테스트 헤더
             query_filter,
             False,        # 캐시 무시 (즉시 최신 결과)
-            5,            # 기본 5개
+            8,            # 헤드라인 8개
         )
     except Exception as e:
         logger.error("[NEWS TEST] error: %s", e)
