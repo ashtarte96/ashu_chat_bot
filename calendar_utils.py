@@ -450,7 +450,7 @@ def _fmt_line(ev: dict) -> str:
         time_part = "• "
 
     imp_part = f"{impact_e} " if impact_e else ""
-    return f"> {time_part}{imp_part}{title_ko}{forecast}"
+    return f"{time_part}{imp_part}{title_ko}{forecast}"
 
 
 def _format_day_section(events: list) -> str:
@@ -468,10 +468,9 @@ def _format_day_section(events: list) -> str:
         if currency not in by_country:
             continue
         flag, name = _COUNTRY_INFO[currency]
+        lines = "\n".join(_fmt_line(ev) for ev in by_country[currency])
         section += f"{flag} <b>{_html.escape(name)}</b>\n"
-        for ev in by_country[currency]:
-            section += _fmt_line(ev) + "\n"
-        section += "\n"
+        section += f"<blockquote>{lines}</blockquote>\n\n"
 
     others = [
         ev for cur, evs in by_country.items()
@@ -481,10 +480,9 @@ def _format_day_section(events: list) -> str:
     ]
     if others:
         others.sort(key=_sort_key)
+        lines = "\n".join(_fmt_line(ev) for ev in others)
         section += f"{_OTHER_FLAG} <b>{_html.escape(_OTHER_NAME)}</b>\n"
-        for ev in others:
-            section += _fmt_line(ev) + "\n"
-        section += "\n"
+        section += f"<blockquote>{lines}</blockquote>\n\n"
 
     return section
 
@@ -531,7 +529,7 @@ def build_calendar_message(is_test: bool = False) -> str:
     if today_events:
         message += _format_day_section(today_events)
     else:
-        message += "> 오늘 일정 없슈 😴\n"
+        message += "<blockquote>오늘 일정 없슈 😴</blockquote>\n"
 
     message += "\n---\n\n"
 
@@ -540,7 +538,7 @@ def build_calendar_message(is_test: bool = False) -> str:
     if tomorrow_events:
         message += _format_day_section(tomorrow_events)
     else:
-        message += "> 내일 일정 없슈 😴\n"
+        message += "<blockquote>내일 일정 없슈 😴</blockquote>\n"
 
     # 오늘+내일 모두 비었을 때만 추가 fallback 섹션 표시
     if extra_events:
