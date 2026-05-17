@@ -2113,7 +2113,7 @@ def main() -> None:
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
     app.add_handler(CommandHandler('news',      cmd_news))
-    app.add_handler(CommandHandler('calendar',  cmd_calendar))
+    app.add_handler(CommandHandler('GC',        cmd_calendar))
 
     # 자동 발송 스케줄러 (TARGET_CHAT_ID 환경변수 필요)
     if TARGET_CHAT_ID and app.job_queue:
