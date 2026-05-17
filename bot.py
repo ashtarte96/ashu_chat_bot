@@ -53,6 +53,7 @@ from telegram.ext import (
 import datetime as _dt
 
 import news_utils
+import calendar_utils
 from database import Database
 from chart_utils import (
     create_clean_candlestick_chart,
@@ -2033,6 +2034,61 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ═══════════════════════════════════════════════════
+# 경제 캘린더
+# ═══════════════════════════════════════════════════
+
+async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """스케줄러가 매일 07:00 KST에 호출하는 경제 캘린더 자동 발송."""
+    data    = context.job.data or {}
+    chat_id = data.get('chat_id')
+    print(f"[ECONOMIC CALENDAR SEND] auto briefing → chat_id={chat_id}")
+    try:
+        text = await asyncio.to_thread(calendar_utils.build_calendar_message, False)
+        for chunk in _split_message(text):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        print("[ECONOMIC CALENDAR SEND] auto briefing sent OK")
+    except Exception:
+        print("[ECONOMIC CALENDAR SEND] Error:")
+        import traceback
+        traceback.print_exc()
+
+
+async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/calendar → 오늘 경제 일정 테스트 출력 (관리자 전용)."""
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+
+    processing_msg = await update.message.reply_text("📅 경제 캘린더 조회 중...")
+    try:
+        text = await asyncio.to_thread(calendar_utils.build_calendar_message, True)
+    except Exception as exc:
+        logger.error("[CALENDAR] error: %s", exc)
+        text = "경제 캘린더 조회 실패: " + str(exc)
+
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    for chunk in _split_message(text):
+        await update.message.reply_text(
+            chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    print("[ECONOMIC CALENDAR SEND] /calendar test sent OK")
+
+
+# ═══════════════════════════════════════════════════
 # 봇 시작
 # ═══════════════════════════════════════════════════
 
@@ -2057,17 +2113,27 @@ def main() -> None:
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
     app.add_handler(CommandHandler('news',      cmd_news))
+    app.add_handler(CommandHandler('calendar',  cmd_calendar))
 
-    # 뉴스 자동 발송 스케줄러 (TARGET_CHAT_ID 환경변수 필요)
+    # 자동 발송 스케줄러 (TARGET_CHAT_ID 환경변수 필요)
     if TARGET_CHAT_ID and app.job_queue:
         try:
             chat_id_int = int(TARGET_CHAT_ID)
+            # 07:00 KST — 경제 캘린더
+            app.job_queue.run_daily(
+                calendar_briefing_job,
+                time=_dt.time(7, 0, 0, tzinfo=KST),
+                data={'chat_id': chat_id_int},
+                name='calendar_briefing',
+            )
+            # 08:00 KST — 뉴스 오전 브리핑
             app.job_queue.run_daily(
                 news_briefing_job,
                 time=_dt.time(8, 0, 0, tzinfo=KST),
                 data={'chat_id': chat_id_int, 'period': 'morning'},
                 name='morning_news',
             )
+            # 17:00 KST — 뉴스 오후 브리핑
             app.job_queue.run_daily(
                 news_briefing_job,
                 time=_dt.time(17, 0, 0, tzinfo=KST),
@@ -2075,13 +2141,14 @@ def main() -> None:
                 name='evening_news',
             )
             logger.info(
-                "[NEWS SEND] Scheduled 08:00 & 17:00 KST → chat_id=%s", TARGET_CHAT_ID
+                "[SCHEDULER] 07:00 calendar / 08:00 & 17:00 news → chat_id=%s",
+                TARGET_CHAT_ID,
             )
         except ValueError:
-            logger.warning("[NEWS SEND] TARGET_CHAT_ID is not a valid integer: %s", TARGET_CHAT_ID)
+            logger.warning("[SCHEDULER] TARGET_CHAT_ID is not a valid integer: %s", TARGET_CHAT_ID)
     elif TARGET_CHAT_ID:
         logger.warning(
-            "[NEWS SEND] TARGET_CHAT_ID set but job_queue unavailable. "
+            "[SCHEDULER] TARGET_CHAT_ID set but job_queue unavailable. "
             "Install: python-telegram-bot[job-queue]"
         )
 
