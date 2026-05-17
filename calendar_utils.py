@@ -450,7 +450,7 @@ def _fmt_line(ev: dict) -> str:
         time_part = "• "
 
     imp_part = f"{impact_e} " if impact_e else ""
-    return f"{time_part}{imp_part}{title_ko}{forecast}"
+    return f"> {time_part}{imp_part}{title_ko}{forecast}"
 
 
 def _format_day_section(events: list) -> str:
@@ -531,7 +531,7 @@ def build_calendar_message(is_test: bool = False) -> str:
     if today_events:
         message += _format_day_section(today_events)
     else:
-        message += "오늘 일정 없슈 😴\n"
+        message += "> 오늘 일정 없슈 😴\n"
 
     message += "\n---\n\n"
 
@@ -540,7 +540,7 @@ def build_calendar_message(is_test: bool = False) -> str:
     if tomorrow_events:
         message += _format_day_section(tomorrow_events)
     else:
-        message += "내일 일정 없슈 😴\n"
+        message += "> 내일 일정 없슈 😴\n"
 
     # 오늘+내일 모두 비었을 때만 추가 fallback 섹션 표시
     if extra_events:
