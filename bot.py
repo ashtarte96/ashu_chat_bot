@@ -24,6 +24,7 @@ bot.py
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -404,6 +405,63 @@ def _fetch_btc_dominance() -> float:
     )
     r.raise_for_status()
     return float(r.json()['data']['market_cap_percentage']['btc'])
+
+
+# ── Fear & Greed 감성 멘트 ────────────────────────────────────────────────────
+
+_FNG_TIERS: list[tuple] = [
+    (0,  24, "😱 극도의 공포", [
+        "다들 도망갈 때 주워담는 사람이 있슈...",
+        "진짜 공포는 지금 아닐 수도 있슈. 조금만 더 기다려 보슈",
+        "극도의 공포는 종종 기회가 되기도 하슈 🤫",
+        "무서우면 소량씩 분할매수가 답 아니겠슈?",
+        "지금 강한 멘탈이 필요한 시기슈. 버텨 보슈",
+    ]),
+    (25, 44, "🥶 공포", [
+        "시장이 불안해 보이슈. 리스크 관리 잘 하슈",
+        "공포 구간이슈. 손절보단 리밸런싱이 나을 수도 있슈",
+        "모두가 두려워할 때 기회가 보이기도 하슈 👀",
+        "지금은 욕심보단 신중함이 맞는 것 같슈",
+        "조심스러운 분위기슈. 무리한 레버리지는 금물이슈 ⚠️",
+    ]),
+    (45, 55, "😐 중립", [
+        "시장이 방향을 고민 중인 것 같슈",
+        "중립 구간이슈. 눈치 게임 중인 분위기슈",
+        "애매한 시기슈. 확신 없다면 관망도 전략이슈",
+        "뚜렷한 방향성이 없는 것 같슈. 차트나 좀 더 봐야겠슈",
+        "중립이면 쉬는 날 아니겠슈? 😴",
+    ]),
+    (56, 74, "🙂 탐욕", [
+        "분위기 나쁘지 않슈. 하지만 방심은 금물이슈",
+        "탐욕 구간이슈. 슬슬 리스크도 같이 커지는 중이슈",
+        "시장이 달아오르고 있슈. 수익 실현 타이밍도 생각해 보슈 📊",
+        "올라갈 때는 좋지만 출구 전략도 준비해 두슈",
+        "기분 좋은 구간이슈. 과도한 레버리지는 조심하슈",
+    ]),
+    (75, 100, "🚀 극도의 탐욕", [
+        "슬슬 설거지 냄새 나는 것 같슈...",
+        "모두가 달려들 때가 제일 위험할 수 있슈 ⚡",
+        "FOMO 조심하슈. 지금 들어가면 물릴 수도 있슈",
+        "탑이 어딘지 모르는 게 탑의 속성이슈 😅",
+        "극도의 탐욕... 수익 있다면 일부 실현 고려해 보슈 💰",
+    ]),
+]
+
+
+def _fng_comment(value) -> str:
+    """Fear & Greed value → 구간 라벨 + 아슈 멘트 문자열."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return ""
+    print(f"[FNG FETCH] value={v}")
+    for lo, hi, label, comments in _FNG_TIERS:
+        if lo <= v <= hi:
+            comment = random.choice(comments)
+            print(f"[FNG VALUE] {v} → {label}")
+            print(f"[FNG COMMENT] {comment}")
+            return f"\n{label}\n🐰 아슈: {comment}"
+    return ""
 
 
 def _fetch_fear_greed() -> tuple:
@@ -1600,6 +1658,70 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ═══════════════════════════════════════════════════
+# /luck 오늘의 코인 운세
+# ═══════════════════════════════════════════════════
+
+_LUCK_STARS = ['⭐⭐⭐⭐⭐', '⭐⭐⭐⭐☆', '⭐⭐⭐☆☆', '⭐⭐☆☆☆', '⭐☆☆☆☆']
+_LUCK_FIRE  = ['🔥🔥🔥🔥🔥', '🔥🔥🔥🔥☆', '🔥🔥🔥☆☆', '🔥🔥☆☆☆', '🔥☆☆☆☆']
+_LUCK_KP    = ['📈📈📈', '📈📈📉', '📈📉📉', '📉📉📉']
+_LUCK_COMMENTS = [
+    "오늘은 관망이 답 같슈 😴",
+    "숏 잡았다간 위험할 수도 있슈 ⚡",
+    "오늘은 알트가 미쳐날뛰는 날 같슈 🚀",
+    "BTC가 방향 잡기 전까지 조용히 기다리슈",
+    "오늘은 지갑 닫고 차트만 보는 날이슈 👀",
+    "롱 한 번 고려해 볼 만한 날 같슈 📈",
+    "수익 챙기고 쉬는 게 최고의 전략인 날 같슈",
+    "갑작스러운 급등 가능성이 있어 보이슈 🔥",
+    "리스크 관리에 집중하슈 오늘은",
+    "시장이 조용해 보여도 방심하면 안 되겠슈",
+    "오늘은 아무것도 안 하는 것도 투자슈 😌",
+    "변동성이 클 것 같은 날이슈. 포지션 줄이슈",
+    "뉴스에 흔들리지 말고 원칙대로 가슈",
+    "오늘은 알트보다 BTC가 더 나을 것 같슈",
+    "김프가 방향 잡으면 그게 신호일 수 있슈",
+    "오늘의 운세: 무지성 매수는 조금 참으슈 🙏",
+    "장기 보유자에게 유리한 날인 것 같슈 💎",
+    "단기 트레이딩은 조심하슈. 오늘은 쉽지 않을 것 같슈",
+    "예상 밖의 움직임이 나올 수 있는 날 같슈 ⚠️",
+    "오늘은 작은 수익에도 감사하슈 🐰",
+]
+
+
+async def cmd_luck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/luck → 오늘의 코인 운세 (user_id + 날짜 seed, 하루 고정)"""
+    if not update.message:
+        return
+
+    user_id = update.effective_user.id
+    today   = datetime.now(KST).strftime('%Y%m%d')
+    seed    = int(hashlib.md5(f"{user_id}{today}".encode()).hexdigest(), 16) % (2 ** 31)
+
+    print(f"[LUCK CMD] user_id={user_id} date={today}")
+    print(f"[LUCK SEED] seed={seed}")
+
+    rng     = random.Random(seed)
+    btc     = rng.choice(_LUCK_STARS)
+    eth     = rng.choice(_LUCK_STARS)
+    alt     = rng.choice(_LUCK_FIRE)
+    kp      = rng.choice(_LUCK_KP)
+    comment = rng.choice(_LUCK_COMMENTS)
+
+    print(f"[LUCK RESULT] btc={btc} eth={eth} alt={alt} kp={kp} comment={comment}")
+
+    text = (
+        "🐰 오늘의 코인 운세\n\n"
+        f"BTC　　: {btc}\n"
+        f"ETH　　: {eth}\n"
+        f"알트장　: {alt}\n"
+        f"김프　　: {kp}\n\n"
+        f'"{comment}"'
+    )
+    await update.message.reply_text(text)
+
+
+
+# ═══════════════════════════════════════════════════
 # /kp 명령어 (김치프리미엄)
 # ═══════════════════════════════════════════════════
 
@@ -1673,6 +1795,7 @@ async def cmd_kp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🇺🇸 S&P500: {_idx(sp500_val, sp500_chg)}\n\n"
             f"👑 BTC 도미넌스: {btc_str}\n"
             f"😱 공포탐욕지수: {fear_str}"
+            + _fng_comment(fear_value)
         )
 
         logger.info(
@@ -2121,6 +2244,7 @@ async def kp_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🇺🇸 S&P500: {_idx(sp500_val, sp500_chg)}\n\n"
             f"👑 BTC 도미넌스: {btc_str}\n"
             f"😱 공포탐욕지수: {fear_str}"
+            + _fng_comment(fear_value)
         )
         text = f"<b>{header}</b>\n\n{body}"
         await context.bot.send_message(
@@ -2189,6 +2313,7 @@ def main() -> None:
     app.add_handler(CommandHandler('ak',        ak_chart))
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
+    app.add_handler(CommandHandler('luck',      cmd_luck))
     app.add_handler(CommandHandler('news',      cmd_news))
     app.add_handler(CommandHandler('GC',        cmd_calendar))
 

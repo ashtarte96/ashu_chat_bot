@@ -7,6 +7,7 @@ API KEY 불필요.
 import hashlib
 import html as _html
 import json
+import random as _random
 import re
 import time
 from typing import Optional
@@ -777,6 +778,65 @@ def summarize_korean_news(title_ko: str, summary_ko: str) -> tuple[str, str]:
 
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
+# ── 뉴스 감성 분석 ────────────────────────────────────────────────────────────
+
+_SENTIMENT_BULLISH_KW = [
+    'rally', 'surge', 'bullish', 'soar', 'inflow', 'etf', 'approval',
+    'adoption', 'partnership', 'launch', 'milestone', 'record high',
+    '급등', '상승', '호재', '유입', '승인', '기대', '반등', '돌파',
+]
+_SENTIMENT_BEARISH_KW = [
+    'crash', 'plunge', 'bearish', 'outflow', 'inflation', 'ban',
+    'liquidation', 'hack', 'exploit', 'fear', 'sell-off', 'war',
+    '급락', '하락', '악재', '유출', '규제', '해킹', '청산', '우려',
+]
+_SENTIMENT_COMMENTS: dict[str, list[str]] = {
+    'bullish': [
+        "ETF 기대감으로 시장 분위기 괜찮은 편이슈 🚀",
+        "자금 유입 흐름이 보이슈. 분위기 나쁘지 않슈 📈",
+        "긍정적인 뉴스가 많슈. 시장이 달아오를 수 있슈 🔥",
+        "호재가 겹친 날이슈. 가볍게 낙관해도 될 것 같슈 🙂",
+        "상승 모멘텀이 느껴지는 뉴스 흐름이슈 ⬆️",
+    ],
+    'neutral': [
+        "뚜렷한 방향성 없이 혼조세인 하루 같슈",
+        "긍정도 부정도 아닌 분위기슈. 눈치 게임 중이슈 👀",
+        "시장이 방향을 고민 중인 것 같슈. 관망이 답일 수 있슈",
+        "큰 이슈는 없는 것 같슈. 잔잔한 하루가 될 수도 있슈 😴",
+        "애매한 분위기슈. 무리한 포지션은 자제하슈",
+    ],
+    'bearish': [
+        "인플레이션 우려로 위험자산 약세 분위기슈 📉",
+        "악재가 겹친 날이슈. 리스크 관리에 집중하슈 ⚠️",
+        "시장 분위기가 좋지 않슈. 방어적으로 접근하슈",
+        "부정적인 뉴스가 많슈. 무리한 매수는 조심하슈",
+        "약세 시그널이 보이슈. 손실 관리 먼저 하슈 🔻",
+    ],
+}
+
+
+def _sentiment_block(intl_items: list, kr_items: list) -> str:
+    """헤드라인 키워드 기반 감성 분류 → blockquote 멘트 반환."""
+    combined = ' '.join(
+        ((item.get('title') or '') + ' ' + (item.get('_title_ko') or '')).lower()
+        for item in intl_items + kr_items
+    )
+    bull = sum(1 for kw in _SENTIMENT_BULLISH_KW if kw in combined)
+    bear = sum(1 for kw in _SENTIMENT_BEARISH_KW if kw in combined)
+
+    if bull > bear + 1:
+        sentiment = 'bullish'
+    elif bear > bull + 1:
+        sentiment = 'bearish'
+    else:
+        sentiment = 'neutral'
+
+    comment = _random.choice(_SENTIMENT_COMMENTS[sentiment])
+    print(f"[NEWS SENTIMENT] bull={bull} bear={bear} → {sentiment}")
+    print(f"[NEWS COMMENT] {comment}")
+    return f'<blockquote>🐰 오늘 시장 분위기\n\n"{comment}"</blockquote>'
+
+
 def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
     print(f"[BUILD_BRIEFING START] intl={len(intl_items)} kr={len(kr_items)} period={period}")
 
@@ -824,6 +884,9 @@ def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
             line = _fmt_item(item)
             print(f"[FORMAT KR {idx}] {(item.get('_title_ko') or '')[:50]}")
             message += line
+
+    # 감성 요약
+    message += "\n" + _sentiment_block(intl_items, kr_items)
 
     print(f"[RETURN MESSAGE] len={len(message)}")
     return message.rstrip()
