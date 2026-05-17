@@ -468,9 +468,10 @@ def _format_day_section(events: list) -> str:
         if currency not in by_country:
             continue
         flag, name = _COUNTRY_INFO[currency]
-        lines = "\n".join(_fmt_line(ev) for ev in by_country[currency])
         section += f"{flag} <b>{_html.escape(name)}</b>\n"
-        section += f"<blockquote>{lines}</blockquote>\n\n"
+        for ev in by_country[currency]:
+            section += _fmt_line(ev) + "\n"
+        section += "\n"
 
     others = [
         ev for cur, evs in by_country.items()
@@ -480,11 +481,12 @@ def _format_day_section(events: list) -> str:
     ]
     if others:
         others.sort(key=_sort_key)
-        lines = "\n".join(_fmt_line(ev) for ev in others)
         section += f"{_OTHER_FLAG} <b>{_html.escape(_OTHER_NAME)}</b>\n"
-        section += f"<blockquote>{lines}</blockquote>\n\n"
+        for ev in others:
+            section += _fmt_line(ev) + "\n"
+        section += "\n"
 
-    return section
+    return section.rstrip("\n")
 
 
 # ── 메인 빌더 ─────────────────────────────────────────────────────────────────
@@ -524,25 +526,28 @@ def build_calendar_message(is_test: bool = False) -> str:
 
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
-    # 오늘 섹션 — 항상 출력
+    # 오늘 섹션 — 항상 출력, 하루치 전체를 blockquote 하나로 감싸기
     message += "📅 <b>오늘 일정</b>\n\n"
     if today_events:
-        message += _format_day_section(today_events)
+        today_block = _format_day_section(today_events)
+        message += f"<blockquote>{today_block}</blockquote>\n"
     else:
         message += "<blockquote>오늘 일정 없슈 😴</blockquote>\n"
 
     message += "\n---\n\n"
 
-    # 내일 섹션 — 항상 출력
+    # 내일 섹션 — 항상 출력, 하루치 전체를 blockquote 하나로 감싸기
     message += "📅 <b>내일 일정</b>\n\n"
     if tomorrow_events:
-        message += _format_day_section(tomorrow_events)
+        tomorrow_block = _format_day_section(tomorrow_events)
+        message += f"<blockquote>{tomorrow_block}</blockquote>\n"
     else:
         message += "<blockquote>내일 일정 없슈 😴</blockquote>\n"
 
     # 오늘+내일 모두 비었을 때만 추가 fallback 섹션 표시
     if extra_events:
+        extra_block = _format_day_section(extra_events)
         message += f"\n---\n\n📅 <b>{_html.escape(extra_label)}</b>\n\n"
-        message += _format_day_section(extra_events)
+        message += f"<blockquote>{extra_block}</blockquote>\n"
 
     return message.rstrip()
