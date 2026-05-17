@@ -834,7 +834,7 @@ def _sentiment_block(intl_items: list, kr_items: list) -> str:
     comment = _random.choice(_SENTIMENT_COMMENTS[sentiment])
     print(f"[NEWS SENTIMENT] bull={bull} bear={bear} → {sentiment}")
     print(f"[NEWS COMMENT] {comment}")
-    return f'<blockquote>🐰 오늘 시장 분위기\n\n"{comment}"</blockquote>'
+    return f'<b>🐰 오늘 시장 분위기</b>\n<blockquote>"{comment}"</blockquote>'
 
 
 def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
@@ -867,23 +867,31 @@ def _build_briefing(intl_items: list, kr_items: list, period: str) -> str:
         safe_title = _html.escape(title)
         safe_url   = url.replace('&', '&amp;')
         if url:
-            return f'📰 <b><a href="{safe_url}">{safe_title}</a></b>\n'
-        return f'📰 <b>{safe_title}</b>\n'
+            return f'📰 <a href="{safe_url}">{safe_title}</a>'
+        return f'📰 {safe_title}'
 
-    # 해외 뉴스
+    # 해외 뉴스 — 전체를 blockquote 하나로
     message += "🌎 <b>해외 뉴스</b>\n"
+    foreign_lines = []
     for idx, item in enumerate(intl_items):
         line = _fmt_item(item)
         print(f"[FORMAT INTL {idx}] {(item.get('_title_ko') or '')[:50]}")
-        message += line
+        if line:
+            foreign_lines.append(line)
+    if foreign_lines:
+        message += f"<blockquote>{chr(10).join(foreign_lines)}</blockquote>\n"
 
-    # 국내 뉴스
+    # 국내 뉴스 — 전체를 blockquote 하나로
     if kr_items:
         message += "\n🇰🇷 <b>국내 뉴스</b>\n"
+        domestic_lines = []
         for idx, item in enumerate(kr_items):
             line = _fmt_item(item)
             print(f"[FORMAT KR {idx}] {(item.get('_title_ko') or '')[:50]}")
-            message += line
+            if line:
+                domestic_lines.append(line)
+        if domestic_lines:
+            message += f"<blockquote>{chr(10).join(domestic_lines)}</blockquote>\n"
 
     # 감성 요약
     message += "\n" + _sentiment_block(intl_items, kr_items)
