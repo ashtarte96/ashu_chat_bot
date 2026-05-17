@@ -1965,7 +1965,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = data.get('chat_id')
     period  = data.get('period', 'morning')
     hours   = 12 if period == 'morning' else 9
-    print(f"[NEWS SEND] {period} briefing → chat_id={chat_id} hours={hours}")
+    print(f"[NEWS AUTO SEND] {period} → chat_id={chat_id} hours={hours}")
     try:
         text = await asyncio.to_thread(
             news_utils.get_briefing, hours, period, None, True, 8
@@ -1977,9 +1977,9 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-        print(f"[NEWS SEND] {period} briefing sent OK")
+        print(f"[NEWS AUTO SEND] {period} sent OK")
     except Exception:
-        print(f"[NEWS SEND] Error sending {period} briefing:")
+        print(f"[NEWS AUTO SEND] Error sending {period} briefing:")
         import traceback
         traceback.print_exc()
 
@@ -2038,10 +2038,10 @@ async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """스케줄러가 매일 07:00 KST에 호출하는 경제 캘린더 자동 발송."""
+    """스케줄러가 매일 05:00 KST에 호출하는 경제 캘린더 자동 발송."""
     data    = context.job.data or {}
     chat_id = data.get('chat_id')
-    print(f"[ECONOMIC CALENDAR SEND] auto briefing → chat_id={chat_id}")
+    print(f"[GC AUTO SEND] → chat_id={chat_id}")
     try:
         text = await asyncio.to_thread(calendar_utils.build_calendar_message, False)
         for chunk in _split_message(text):
@@ -2051,9 +2051,88 @@ async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-        print("[ECONOMIC CALENDAR SEND] auto briefing sent OK")
+        print("[GC AUTO SEND] sent OK")
     except Exception:
-        print("[ECONOMIC CALENDAR SEND] Error:")
+        print("[GC AUTO SEND] Error:")
+        import traceback
+        traceback.print_exc()
+
+
+async def kp_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """스케줄러가 매일 07:00/16:00 KST에 호출하는 김프 자동 발송."""
+    data    = context.job.data or {}
+    chat_id = data.get('chat_id')
+    period  = data.get('period', 'morning')
+    header  = "🐰 아슈 김프 오전 체크" if period == 'morning' else "🐰 아슈 김프 오후 체크"
+    print(f"[KP AUTO SEND] {period} → chat_id={chat_id}")
+    try:
+        results = await asyncio.gather(
+            asyncio.to_thread(_fetch_usdkrw),
+            asyncio.to_thread(_fetch_usdtkrw),
+            asyncio.to_thread(_fetch_naver_index, 'KOSPI'),
+            asyncio.to_thread(_fetch_naver_index, 'KOSDAQ'),
+            asyncio.to_thread(_fetch_us_index, '^IXIC', '나스닥'),
+            asyncio.to_thread(_fetch_us_index, '^GSPC', 'S&P500'),
+            asyncio.to_thread(_fetch_btc_dominance),
+            asyncio.to_thread(_fetch_fear_greed),
+            return_exceptions=True,
+        )
+        (usdkrw_r, usdtkrw_r,
+         kospi_r, kosdaq_r,
+         nasdaq_r, sp500_r,
+         btc_dom_r, fg_r) = results
+
+        def _unpack_float(r):
+            return float(r) if not isinstance(r, Exception) else None
+
+        def _unpack_pair(r):
+            return r if not isinstance(r, Exception) else (None, None)
+
+        usdkrw  = _unpack_float(usdkrw_r)
+        usdtkrw = _unpack_float(usdtkrw_r)
+        kp      = (usdtkrw / usdkrw - 1) * 100 if usdkrw and usdtkrw else None
+
+        kospi_val,  kospi_chg  = _unpack_pair(kospi_r)
+        kosdaq_val, kosdaq_chg = _unpack_pair(kosdaq_r)
+        nasdaq_val, nasdaq_chg = _unpack_pair(nasdaq_r)
+        sp500_val,  sp500_chg  = _unpack_pair(sp500_r)
+        btc_dom                = _unpack_float(btc_dom_r)
+        fear_value, fear_class = _unpack_pair(fg_r)
+
+        def _fv(v, fmt):
+            return format(v, fmt) if v is not None else 'N/A'
+
+        def _idx(val, chg):
+            if val is None:
+                return 'N/A'
+            s = f"{val:,.2f}"
+            if chg is not None:
+                s += f" ({'+' if chg >= 0 else ''}{chg:.2f}%)"
+            return s
+
+        btc_str  = f"{btc_dom:.2f}%" if btc_dom is not None else 'N/A'
+        fear_str = f"{fear_value} ({fear_class})" if fear_value else 'N/A'
+
+        body = (
+            f"💵 USD/KRW: {_fv(usdkrw, ',.2f')}\n"
+            f"🪙 USDT/KRW: {_fv(usdtkrw, ',.2f')}\n\n"
+            f"🇰🇷 김프: {(f'{kp:+.2f}%') if kp is not None else 'N/A'}\n\n"
+            f"🇰🇷 코스피: {_idx(kospi_val, kospi_chg)}\n"
+            f"🇰🇷 코스닥: {_idx(kosdaq_val, kosdaq_chg)}\n"
+            f"🇺🇸 나스닥: {_idx(nasdaq_val, nasdaq_chg)}\n"
+            f"🇺🇸 S&P500: {_idx(sp500_val, sp500_chg)}\n\n"
+            f"👑 BTC 도미넌스: {btc_str}\n"
+            f"😱 공포탐욕지수: {fear_str}"
+        )
+        text = f"<b>{header}</b>\n\n{body}"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+        )
+        print(f"[KP AUTO SEND] {period} sent OK")
+    except Exception:
+        print(f"[KP AUTO SEND] Error:")
         import traceback
         traceback.print_exc()
 
@@ -2119,29 +2198,54 @@ def main() -> None:
     if TARGET_CHAT_ID and app.job_queue:
         try:
             chat_id_int = int(TARGET_CHAT_ID)
-            # 07:00 KST — 경제 캘린더
-            app.job_queue.run_daily(
-                calendar_briefing_job,
-                time=_dt.time(7, 0, 0, tzinfo=KST),
-                data={'chat_id': chat_id_int},
-                name='calendar_briefing',
+            jq = app.job_queue
+
+            def _register(name, callback, t, data):
+                """기존 동명 job 제거 후 재등록 (재시작 중복 방지)."""
+                for j in jq.get_jobs_by_name(name):
+                    j.schedule_removal()
+                jq.run_daily(callback, time=t, data=data, name=name)
+
+            # ── 경제 캘린더 ──────────────────────────────
+            # 05:00 KST — 출근길 경제 캘린더
+            _register(
+                'gc_morning', calendar_briefing_job,
+                _dt.time(5, 0, 0, tzinfo=KST),
+                {'chat_id': chat_id_int},
             )
+
+            # ── 김치프리미엄 ─────────────────────────────
+            # 07:00 KST — 김프 오전 체크
+            _register(
+                'kp_morning', kp_briefing_job,
+                _dt.time(7, 0, 0, tzinfo=KST),
+                {'chat_id': chat_id_int, 'period': 'morning'},
+            )
+            # 16:00 KST — 김프 오후 체크
+            _register(
+                'kp_evening', kp_briefing_job,
+                _dt.time(16, 0, 0, tzinfo=KST),
+                {'chat_id': chat_id_int, 'period': 'evening'},
+            )
+
+            # ── 뉴스 브리핑 ──────────────────────────────
             # 08:00 KST — 뉴스 오전 브리핑
-            app.job_queue.run_daily(
-                news_briefing_job,
-                time=_dt.time(8, 0, 0, tzinfo=KST),
-                data={'chat_id': chat_id_int, 'period': 'morning'},
-                name='morning_news',
+            _register(
+                'news_morning', news_briefing_job,
+                _dt.time(8, 0, 0, tzinfo=KST),
+                {'chat_id': chat_id_int, 'period': 'morning'},
             )
             # 17:00 KST — 뉴스 오후 브리핑
-            app.job_queue.run_daily(
-                news_briefing_job,
-                time=_dt.time(17, 0, 0, tzinfo=KST),
-                data={'chat_id': chat_id_int, 'period': 'evening'},
-                name='evening_news',
+            _register(
+                'news_evening', news_briefing_job,
+                _dt.time(17, 0, 0, tzinfo=KST),
+                {'chat_id': chat_id_int, 'period': 'evening'},
             )
+
             logger.info(
-                "[SCHEDULER] 07:00 calendar / 08:00 & 17:00 news → chat_id=%s",
+                "[SCHEDULER] Asia/Seoul | "
+                "05:00 gc_morning | 07:00 kp_morning | 08:00 news_morning | "
+                "16:00 kp_evening | 17:00 news_evening → chat_id=%s",
                 TARGET_CHAT_ID,
             )
         except ValueError:
