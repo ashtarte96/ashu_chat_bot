@@ -1,6 +1,7 @@
 """
-calendar_utils.py — 글로벌 경제 캘린더 (ForexFactory XML 기반)
-API KEY 불필요.
+calendar_utils.py — 글로벌 경제 캘린더
+소스 1: ForexFactory XML  (primary)
+소스 2: Investing.com AJAX (secondary, best-effort)
 날짜 기준: Asia/Seoul (KST). ET 시간 → KST 자동 변환 (DST 대응).
 """
 
@@ -13,7 +14,15 @@ import requests
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
-_FF_CAL_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+_FF_URLS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.xml",   # 404면 skip
+]
+
+_INVESTING_URL = (
+    "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+)
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -25,8 +34,8 @@ _HEADERS = {
 }
 _TIMEOUT = 15
 
-_ET_TZ  = pytz.timezone('America/New_York')  # EST/EDT DST 자동 처리
-_KST_TZ = pytz.timezone('Asia/Seoul')        # KST UTC+9 고정
+_ET_TZ  = pytz.timezone('America/New_York')
+_KST_TZ = pytz.timezone('Asia/Seoul')
 
 _NO_TIME = frozenset({'all day', 'tentative', 'day 1', 'day 2', 'weekend', ''})
 
@@ -39,15 +48,23 @@ _COUNTRY_INFO: dict[str, tuple[str, str]] = {
     'JPY': ('🇯🇵', '일본'),
     'EUR': ('🇪🇺', '유럽'),
     'GBP': ('🇬🇧', '영국'),
+    'CAD': ('🇨🇦', '캐나다'),
+    'AUD': ('🇦🇺', '호주'),
+    'NZD': ('🇳🇿', '뉴질랜드'),
+    'CHF': ('🇨🇭', '스위스'),
 }
-_PRIORITY_CURRENCIES = list(_COUNTRY_INFO.keys())
+_PRIORITY_CURRENCIES = ['USD', 'KRW', 'CNY', 'JPY', 'EUR', 'GBP']
 _OTHER_FLAG, _OTHER_NAME = '🌍', '기타'
+
+# Investing.com 국가 ID (내부 API 파라미터)
+_IC_COUNTRY_IDS = ["5", "4", "35", "37", "17", "72"]  # US, UK, JP, CN, DE, EMU
 
 # ── 중요도 ────────────────────────────────────────────────────────────────────
 
-_IMPACT_EMOJI = {'High': '🔥', 'Medium': '⭐'}
-_SHOW_IMPACT  = {'High', 'Medium'}
-_IMPACT_ORDER = {'High': 0, 'Medium': 1}
+# Low 포함: 별 1개 이상 전체 표시
+_SHOW_IMPACT  = {'High', 'Medium', 'Low'}
+_IMPACT_EMOJI = {'High': '🔥', 'Medium': '⭐', 'Low': ''}
+_IMPACT_ORDER = {'High': 0, 'Medium': 1, 'Low': 2}
 
 # ── 이벤트 제목 한국어 맵 ─────────────────────────────────────────────────────
 
@@ -73,16 +90,15 @@ _EVENT_KO: list[tuple[str, str]] = [
     ('FOMC Press Conference',           'FOMC 기자회견'),
     ('FOMC Meeting Minutes',            'FOMC 의사록'),
     ('Powell Speaks',                   '파월 의장 연설'),
-    ('Fed Chair',                       '연준 의장'),
+    ('Fed Chair',                       '연준 의장 발언'),
     # 미국 — 성장
     ('Prelim GDP q/q',                  'GDP 예비치 (전분기비)'),
     ('GDP q/q',                         'GDP (전분기비)'),
-    # 미국 — 소비
+    # 미국 — 소비/제조
     ('Core Retail Sales m/m',           '근원 소매판매 (전월비)'),
     ('Retail Sales m/m',                '소매판매 (전월비)'),
     ('Consumer Confidence',             '소비자신뢰지수'),
     ('Consumer Sentiment',              '소비자심리지수'),
-    # 미국 — 제조/무역
     ('ISM Manufacturing PMI',           '제조업 PMI (ISM)'),
     ('ISM Services PMI',                '서비스업 PMI (ISM)'),
     ('Durable Goods Orders m/m',        '내구재주문 (전월비)'),
@@ -109,8 +125,13 @@ _EVENT_KO: list[tuple[str, str]] = [
     ('BOK Interest Rate Decision',      '한국은행 기준금리 결정'),
     ('Exports y/y',                     '수출 (전년비)'),
     ('Imports y/y',                     '수입 (전년비)'),
+    # 호주/뉴질랜드/캐나다
+    ('Employment Change',               '고용변화'),
+    ('Unemployment Rate',               '실업률'),
+    ('Claimant Count Change',           '실업수당 신청건수'),
     # 기타
     ('OPEC',                            'OPEC 회의'),
+    ('New Home Prices',                 '신규 주택가격'),
 ]
 
 
@@ -122,10 +143,10 @@ def _ko_title(title: str) -> str:
     return title
 
 
-# ── 날짜/시간 유틸 ────────────────────────────────────────────────────────────
+# ── 날짜/시간 변환 ────────────────────────────────────────────────────────────
 
 def _parse_ff_date(date_str: str) -> _date | None:
-    for fmt in ('%m-%d-%Y', '%Y-%m-%d'):
+    for fmt in ('%m-%d-%Y', '%Y-%m-%d', '%m/%d/%Y'):
         try:
             return datetime.strptime(date_str.strip(), fmt).date()
         except ValueError:
@@ -137,7 +158,7 @@ def _et_to_kst(ev_date: _date, time_str: str) -> tuple[datetime | None, str]:
     """
     ForexFactory ET 날짜+시간 → (KST datetime, 'HH:MM').
     All Day / Tentative → (None, '종일').
-    DST는 pytz 자동 처리.
+    pytz 로 DST(EST/EDT) 자동 처리.
     """
     t_norm = (time_str or '').strip().lower()
     if t_norm in _NO_TIME:
@@ -165,30 +186,31 @@ def _et_to_kst(ev_date: _date, time_str: str) -> tuple[datetime | None, str]:
         return None, '미정'
 
 
-# ── 데이터 fetch ──────────────────────────────────────────────────────────────
+# ── Source 1: ForexFactory XML ────────────────────────────────────────────────
 
-def _fetch_all_week_events() -> list:
-    """ForexFactory 주간 XML에서 Medium+ 이벤트 전체 파싱."""
-    print(f"[ECONOMIC CALENDAR FETCH] url={_FF_CAL_URL}")
+def _fetch_ff_xml(url: str) -> list:
+    """단일 ForexFactory XML URL 파싱. 실패·404면 빈 리스트 반환."""
     try:
-        resp = requests.get(_FF_CAL_URL, headers=_HEADERS, timeout=_TIMEOUT)
+        resp = requests.get(url, headers=_HEADERS, timeout=_TIMEOUT)
+        if resp.status_code == 404:
+            print(f"[FOREXFACTORY FETCH] 404 skip: {url.split('/')[-1]}")
+            return []
         resp.raise_for_status()
         root = ET.fromstring(resp.content)
     except requests.exceptions.RequestException as exc:
-        print(f"[ECONOMIC CALENDAR FETCH] HTTP error: {exc}")
+        print(f"[FOREXFACTORY FETCH] HTTP error ({url.split('/')[-1]}): {exc}")
         return []
     except ET.ParseError as exc:
-        print(f"[ECONOMIC CALENDAR FETCH] XML parse error: {exc}")
+        print(f"[FOREXFACTORY FETCH] XML parse error ({url.split('/')[-1]}): {exc}")
         return []
 
     events: list = []
-    total_xml    = 0
+    skipped_impact = 0
 
     for ev in root.findall('event'):
-        total_xml += 1
-
         impact = (ev.findtext('impact') or '').strip()
         if impact not in _SHOW_IMPACT:
+            skipped_impact += 1
             continue
 
         date_str = (ev.findtext('date') or '').strip()
@@ -207,9 +229,7 @@ def _fetch_all_week_events() -> list:
         actual   = (ev.findtext('actual')   or '').strip()
 
         kst_dt, kst_time = _et_to_kst(ev_date, time_str)
-
-        # KST 날짜 기준: 시간 있으면 변환 결과, All Day면 ET 날짜를 그대로 사용
-        kst_date: _date = kst_dt.date() if kst_dt else ev_date
+        kst_date: _date  = kst_dt.date() if kst_dt else ev_date
 
         events.append({
             'title':    title,
@@ -222,33 +242,160 @@ def _fetch_all_week_events() -> list:
             'kst_dt':   kst_dt,
             'kst_time': kst_time,
             'kst_date': kst_date,
+            '_src':     'ff',
         })
 
-    print(f"[ECONOMIC CALENDAR FETCH] xml_total={total_xml} medium_plus={len(events)}")
+    print(
+        f"[FOREXFACTORY FETCH] {url.split('/')[-1]}: "
+        f"included={len(events)} skipped_low_impact={skipped_impact}"
+    )
     return events
 
 
-def fetch_calendar_by_kst_dates(target_dates: list[_date]) -> dict[_date, list]:
+# ── Source 2: Investing.com AJAX (best-effort) ────────────────────────────────
+
+def _fetch_investing_calendar(from_date: _date, to_date: _date) -> list:
     """
-    KST 날짜 리스트 기준으로 이벤트를 그룹핑해 반환.
-    각 날짜 내 중복 제거 포함.
+    Investing.com 경제 캘린더 AJAX 엔드포인트 (best-effort).
+    응답이 HTML이므로 BeautifulSoup으로 파싱.
+    봇 탐지 등으로 실패하면 빈 리스트 반환.
     """
-    all_events = _fetch_all_week_events()
-    target_set = set(target_dates)
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("[INVESTING FETCH] beautifulsoup4 not installed, skip")
+        return []
 
-    buckets: dict[_date, list] = {d: [] for d in target_dates}
-    for ev in all_events:
-        if ev['kst_date'] in target_set:
-            buckets[ev['kst_date']].append(ev)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer":           "https://www.investing.com/economic-calendar/",
+        "Content-Type":      "application/x-www-form-urlencoded",
+        "Origin":            "https://www.investing.com",
+        "Accept":            "text/html,*/*;q=0.8",
+        "Accept-Language":   "en-US,en;q=0.9",
+    }
+    # timeZone=0 = UTC; 변환은 우리가 직접 수행
+    payload = {
+        "country[]":      _IC_COUNTRY_IDS,
+        "importance[]":   ["1", "2", "3"],          # Low/Medium/High 전부
+        "timeZone":       "0",                      # UTC
+        "timeFilter":     "timeRemain",
+        "currentTab":     "custom",
+        "submitFilters":  "1",
+        "dateFrom":       from_date.strftime('%Y-%m-%d'),
+        "dateTo":         to_date.strftime('%Y-%m-%d'),
+        "limit_from":     "0",
+    }
 
-    # 날짜별 중복 제거
-    for d in buckets:
-        buckets[d] = _dedupe(buckets[d])
+    try:
+        resp = requests.post(_INVESTING_URL, headers=headers,
+                             data=payload, timeout=_TIMEOUT)
+        resp.raise_for_status()
 
-    return buckets
+        # 응답이 JSON {"data": "<html>..."} 형태인 경우 처리
+        try:
+            import json as _json
+            j = _json.loads(resp.text)
+            html_body = j.get('data', '') or resp.text
+        except Exception:
+            html_body = resp.text
+
+        soup = BeautifulSoup(html_body, 'html.parser')
+        rows = soup.find_all('tr', attrs={'data-event-datetime': True})
+
+        _UTC_TZ = pytz.utc
+        events  = []
+        skipped = 0
+
+        # importance: 별 수 (grayFullBullishIcon 개수)
+        _imp_map = {3: 'High', 2: 'Medium', 1: 'Low'}
+
+        for row in rows:
+            try:
+                dt_str  = row['data-event-datetime']          # "2025-01-17 08:30:00"
+                cur_td  = row.find('td', class_='flagCur')
+                evt_td  = row.find('td', class_='event')
+                fore_td = row.find('td', class_='fore')
+
+                if not cur_td or not evt_td:
+                    continue
+
+                currency = cur_td.get_text(strip=True).upper()[-3:]  # "USD"
+                title    = evt_td.get_text(strip=True)
+                forecast = fore_td.get_text(strip=True) if fore_td else ''
+
+                # 중요도
+                icons   = row.find_all('i', class_='grayFullBullishIcon')
+                n_stars = len(icons)
+                impact  = _imp_map.get(n_stars, 'Low')
+
+                # UTC → KST 변환
+                naive   = datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
+                utc_dt  = _UTC_TZ.localize(naive)
+                kst_dt  = utc_dt.astimezone(_KST_TZ)
+
+                events.append({
+                    'title':    title,
+                    'title_ko': _ko_title(title),
+                    'country':  currency,
+                    'impact':   impact,
+                    'forecast': forecast,
+                    'previous': '',
+                    'actual':   '',
+                    'kst_dt':   kst_dt,
+                    'kst_time': kst_dt.strftime('%H:%M'),
+                    'kst_date': kst_dt.date(),
+                    '_src':     'ic',
+                })
+            except Exception:
+                skipped += 1
+                continue
+
+        print(f"[INVESTING FETCH] total={len(events)} skipped={skipped}")
+        return events
+
+    except Exception as exc:
+        print(f"[INVESTING FETCH] failed (expected if blocked): {exc}")
+        return []
 
 
-# ── 중복 제거 ─────────────────────────────────────────────────────────────────
+# ── 전체 이벤트 fetch ─────────────────────────────────────────────────────────
+
+def _fetch_all_events() -> list:
+    """ForexFactory(primary) + Investing.com(secondary) 병합, 중복 제거."""
+    all_events: list = []
+
+    # Source 1: ForexFactory (this week + next week)
+    ff_total = 0
+    for url in _FF_URLS:
+        evs = _fetch_ff_xml(url)
+        all_events.extend(evs)
+        ff_total += len(evs)
+    print(f"[FOREXFACTORY FETCH] combined_total={ff_total}")
+
+    # Source 2: Investing.com (best-effort, 5일 범위)
+    now_kst    = datetime.now(_KST_TZ)
+    from_date  = now_kst.date()
+    to_date    = from_date + timedelta(days=4)
+    ic_events  = _fetch_investing_calendar(from_date, to_date)
+
+    # IC 이벤트 중 FF에 없는 것만 추가 (url 중복 없으므로 제목+날짜로 판단)
+    ff_keys = {(e['title'].lower(), e['kst_date']) for e in all_events}
+    for ev in ic_events:
+        key = (ev['title'].lower(), ev['kst_date'])
+        if key not in ff_keys:
+            all_events.append(ev)
+            ff_keys.add(key)
+
+    print(f"[ECONOMIC CALENDAR FETCH] merged_total={len(all_events)}")
+    return all_events
+
+
+# ── 날짜별 그룹핑 ─────────────────────────────────────────────────────────────
 
 def _dedupe(events: list) -> list:
     seen: set = set()
@@ -261,10 +408,27 @@ def _dedupe(events: list) -> list:
     return result
 
 
+def fetch_calendar_by_kst_dates(target_dates: list[_date]) -> dict[_date, list]:
+    all_events = _fetch_all_events()
+    target_set = set(target_dates)
+
+    buckets: dict[_date, list] = {d: [] for d in target_dates}
+    for ev in all_events:
+        if ev['kst_date'] in target_set:
+            buckets[ev['kst_date']].append(ev)
+
+    for d in buckets:
+        buckets[d] = _dedupe(buckets[d])
+
+    # GC 필터 로그
+    total_after = sum(len(v) for v in buckets.values())
+    print(f"[GC FILTER] after_dedup={total_after} for dates={[str(d) for d in target_dates]}")
+    return buckets
+
+
 # ── 정렬 ──────────────────────────────────────────────────────────────────────
 
 def _sort_key(ev: dict) -> tuple:
-    """KST 시간 오름차순 → 같은 시간 내 High 먼저 → 시간 없는 것 맨 뒤."""
     kst_dt = ev.get('kst_dt')
     return (
         kst_dt.timestamp() if kst_dt else float('inf'),
@@ -275,7 +439,6 @@ def _sort_key(ev: dict) -> tuple:
 # ── 포맷 ──────────────────────────────────────────────────────────────────────
 
 def _fmt_line(ev: dict) -> str:
-    """🕘 HH:MM 🔥/⭐ 제목 (예상 X%)"""
     impact_e = _IMPACT_EMOJI.get(ev['impact'], '')
     title_ko = _html.escape(ev['title_ko'])
     kst_time = ev.get('kst_time', '미정')
@@ -291,7 +454,7 @@ def _fmt_line(ev: dict) -> str:
 
 
 def _format_day_section(events: list) -> str:
-    """하루치 이벤트를 국가별로 묶어 포맷."""
+    """하루치 이벤트를 국가별로 묶어 포맷. 각 국가 내 KST 시간순 정렬."""
     by_country: dict[str, list] = {}
     for ev in events:
         by_country.setdefault(ev['country'], []).append(ev)
@@ -310,12 +473,11 @@ def _format_day_section(events: list) -> str:
             section += _fmt_line(ev) + "\n"
         section += "\n"
 
-    # 기타 (우선 국가 이외 High 한정)
     others = [
         ev for cur, evs in by_country.items()
         if cur not in _PRIORITY_CURRENCIES
         for ev in evs
-        if ev['impact'] == 'High'
+        if ev['impact'] in ('High', 'Medium')   # 기타는 Medium+ 만
     ]
     if others:
         others.sort(key=_sort_key)
@@ -327,42 +489,63 @@ def _format_day_section(events: list) -> str:
     return section
 
 
+# ── 메인 빌더 ─────────────────────────────────────────────────────────────────
+
 def build_calendar_message(is_test: bool = False) -> str:
-    """오늘 + 내일 (KST 기준) 경제 캘린더 텔레그램 메시지 빌드."""
+    """오늘+내일 (KST 기준) 경제 캘린더. 둘 다 비면 +2~+4일까지 자동 확장."""
     header = "🐰 아슈 경제 캘린더 테스트" if is_test else "🐰 아슈 출근길 글로벌 경제 캘린더"
 
     now_kst      = datetime.now(_KST_TZ)
     today_kst    = now_kst.date()
-    tomorrow_kst = (now_kst + timedelta(days=1)).date()
+    tomorrow_kst = today_kst + timedelta(days=1)
 
+    # 오늘/내일 fetch
     buckets = fetch_calendar_by_kst_dates([today_kst, tomorrow_kst])
-
     today_events    = buckets.get(today_kst,    [])
     tomorrow_events = buckets.get(tomorrow_kst, [])
 
     print(f"[GC TODAY COUNT]    {len(today_events)}")
     print(f"[GC TOMORROW COUNT] {len(tomorrow_events)}")
 
+    # 오늘+내일 모두 비면 최대 4일 후까지 확장
+    extra_label  = ""
+    extra_events = []
     if not today_events and not tomorrow_events:
+        for delta in range(2, 5):
+            extra_date = today_kst + timedelta(days=delta)
+            extra_bkt  = fetch_calendar_by_kst_dates([extra_date])
+            cands      = extra_bkt.get(extra_date, [])
+            if cands:
+                extra_events = cands
+                extra_label  = extra_date.strftime('%m/%d') + " 일정"
+                print(f"[GC FINAL] no today/tomorrow → fallback to +{delta}d ({extra_date})")
+                break
+
+    # 이벤트 없으면 종료
+    if not today_events and not tomorrow_events and not extra_events:
         return (
             f"<b>{_html.escape(header)}</b>\n\n"
-            "📭 오늘/내일 주요 경제 일정이 없습니다."
+            "📭 이번 주 주요 경제 일정이 없습니다."
         )
+
+    total_final = len(today_events) + len(tomorrow_events) + len(extra_events)
+    print(f"[GC FINAL] total_shown={total_final}")
 
     message = f"<b>{_html.escape(header)}</b>\n\n"
 
-    # ── 오늘 일정 ──
     if today_events:
         message += "📅 <b>오늘 일정</b>\n\n"
         message += _format_day_section(today_events)
 
-    # ── 구분선 ──
-    if today_events and tomorrow_events:
+    if today_events and (tomorrow_events or extra_events):
         message += "---\n\n"
 
-    # ── 내일 일정 ──
     if tomorrow_events:
         message += "📅 <b>내일 일정</b>\n\n"
         message += _format_day_section(tomorrow_events)
+
+    if extra_events:
+        message += f"📅 <b>{_html.escape(extra_label)}</b>\n\n"
+        message += _format_day_section(extra_events)
 
     return message.rstrip()
