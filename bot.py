@@ -84,8 +84,8 @@ if not TELEGRAM_BOT_TOKEN:
         "  $env:TELEGRAM_BOT_TOKEN='your_token'   (PowerShell)"
     )
 
-MUTE_HOURS     = 24
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "")
+MUTE_HOURS       = 24
+ANNOUNCE_CHAT_ID = os.getenv("ANNOUNCE_CHAT_ID", "")
 
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -738,8 +738,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    [답글 모드]  메시지에 답글로 /bw  → 해당 메시지를 스팸 차단문구로 등록 + 삭제 + mute
-    [조회]       /bw (인자 없음)      → 사용법 안내
+    [답글 모드]   메시지에 답글로 /bw  → 스팸 차단문구 등록 + 삭제 + mute
+    [광고 설정]   /bw <문구>           → 광고문구 설정 (차트 하단 미출력)
+    [광고 초기화] /bw clear            → 광고문구 삭제
+    [조회]        /bw (인자 없음)      → 현재 광고문구 출력
     """
     if not update.message:
         return
@@ -812,13 +814,56 @@ async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
             return
 
-        # 답글 없이 직접 입력 → 사용법 안내
-        await update.message.reply_text(
-            "📌 /bw 사용법\n\n"
-            "차단할 메시지에 답글을 달고 /bw 를 입력하세요.\n"
-            "해당 메시지가 차단문구로 등록되고 발신자가 mute됩니다.\n\n"
-            "차단문구 목록 확인: /banwords"
+        # ── 직접 모드: 광고문구 관리 ──────────────────────────────────
+        args_text = ' '.join(context.args).strip() if context.args else ''
+
+        # /bw (인자 없음) → 현재 광고문구 출력
+        if not args_text:
+            cur = ad_manager.get_ad()
+            if cur:
+                await update.message.reply_text(
+                    f"현재 광고문구 (v{ad_manager.version}):\n\n{cur}\n\n"
+                    "/bw 새문구 → 변경   /bw clear → 삭제"
+                )
+            else:
+                await update.message.reply_text(
+                    "현재 설정된 광고문구가 없습니다.\n\n"
+                    "/bw 문구 → 광고문구 설정"
+                )
+            return
+
+        # /bw clear → 광고문구 삭제
+        if args_text.lower() == 'clear':
+            ad_manager.clear_ad()
+            sent = await update.message.reply_text(
+                f"✅ 광고문구가 삭제되었습니다. (v{ad_manager.version})"
+            )
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+            return
+
+        # /bw <문구> → 광고문구 설정 (차트 캡션에는 출력되지 않음)
+        version = ad_manager.set_ad(args_text)
+        logger.info("[BW] 광고문구 설정 v%d: %r", version, args_text)
+        sent = await update.message.reply_text(
+            f"✅ 광고문구가 설정되었습니다. (v{version})\n\n{args_text}"
         )
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+        try:
+            await sent.delete()
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error("cmd_banword 오류: %s", e)
@@ -1571,26 +1616,37 @@ _HELP_TEXT = (
     "/ap BTC → 코인 선물 차트\n"
     "/ak 삼성전자 → 한국 주식\n"
     "/au AAPL → 미국 주식\n"
-    "⏱ 인터벌: 1h / 4h / 12h / 1d / 1w / 1y\n"
     "\n"
-    "📰 뉴스 / 일정 (관리자)\n"
-    "/news → 글로벌 뉴스 테스트\n"
-    "/GC → 경제 캘린더 테스트\n"
+    "⏱ 인터벌:\n"
+    "1h / 4h / 12h / 1d / 1w / 1y\n"
     "\n"
-    "🚫 제재 / 차단 (관리자)\n"
-    "/bw → 메시지에 답글로 차단문구 등록 + mute\n"
+    "📰 뉴스 / 일정\n"
+    "/news → 글로벌 뉴스 테스트 (관리자)\n"
+    "/GC → 경제 캘린더 테스트 (관리자)\n"
+    "\n"
+    "🍚 재미 기능\n"
+    "/food → 점심/저녁/야식 추천\n"
+    "/luck → 오늘의 코인 운세\n"
+    "\n"
+    "📣 광고 / 관리 (관리자)\n"
+    "/bw 문구 → 광고문구 설정\n"
+    "/bw → 현재 광고 확인\n"
+    "/bw clear → 광고 삭제\n"
+    "/banwords → 차단 목록\n"
+    "/dw 문구 → 차단 문구 삭제\n"
     "/mute → 유저 mute\n"
     "/unmute → mute 해제\n"
-    "/banwords → 차단 목록\n"
+    "\n"
+    "🔒 자동 기능\n"
+    "• 신규 입장자 수학 인증\n"
+    "• 뉴스 자동발송: 오전 8시 / 오후 5시\n"
+    "• 김프 자동발송: 오전 7시 / 오후 4시\n"
+    "• 경제캘린더 자동발송: 오전 5시\n"
     "\n"
     "🔧 기타\n"
     "/help → 도움말\n"
-    "/nettest → 서버 테스트 (관리자)\n"
-    "\n"
-    "⏰ 자동 브리핑\n"
-    "• 경제캘린더: 오전 5시\n"
-    "• 김프: 오전 7시 / 오후 4시\n"
-    "• 뉴스: 오전 8시 / 오후 5시"
+    "/nettest → 서버 테스트\n"
+    "/sendtest → 공지방 발송 테스트 (관리자)"
 )
 
 
@@ -1598,6 +1654,96 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(_HELP_TEXT)
+
+
+async def cmd_sendtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/sendtest → ANNOUNCE_CHAT_ID로 테스트 메시지 발송 (관리자 전용)."""
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+
+    if not ANNOUNCE_CHAT_ID:
+        await update.message.reply_text(
+            "ANNOUNCE_CHAT_ID 환경변수가 설정되지 않았습니다.\n"
+            ".env 파일에 ANNOUNCE_CHAT_ID=채널ID 를 추가해주세요."
+        )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(ANNOUNCE_CHAT_ID),
+            text="🐰 아슈봇 자동발송 테스트",
+        )
+        await update.message.reply_text(
+            f"✅ 공지방 테스트 발송 완료\nchat_id={ANNOUNCE_CHAT_ID}"
+        )
+        print(f"[SENDTEST] OK → chat_id={ANNOUNCE_CHAT_ID}")
+    except Exception as e:
+        err = str(e)
+        print(f"[ANNOUNCE SEND ERROR] {err}")
+        if "not enough rights" in err or "bot is not a member" in err or "Forbidden" in err:
+            await update.message.reply_text(
+                "❌ 공지방 전송 실패\n\n"
+                "[ANNOUNCE SEND ERROR]\nbot has no permission\n\n"
+                "봇을 공지방/채널에 관리자로 추가하고\n메시지 게시 권한을 부여해주세요."
+            )
+        else:
+            await update.message.reply_text(f"❌ 발송 실패: {e}")
+
+
+# ═══════════════════════════════════════════════════
+# /food 음식 추천
+# ═══════════════════════════════════════════════════
+
+_FOOD_MENUS = {
+    'lunch': [
+        '김치찌개 🥘', '된장찌개 🍲', '순두부찌개 🍜', '부대찌개 🥘',
+        '제육볶음 🍖', '삼겹살 🥓', '닭갈비 🍗', '냉면 🍜',
+        '비빔밥 🍚', '갈비탕 🍲', '설렁탕 🍲', '곰탕 🍲',
+        '짜장면 🍝', '짬뽕 🍜', '쌀국수 🍜', '돈까스 🍱',
+    ],
+    'dinner': [
+        '삼겹살 🥓', '치킨 🍗', '갈비구이 🍖', '회 🐟',
+        '초밥 🍣', '보쌈 🥬', '족발 🍖', '곱창 🔥',
+        '삼계탕 🍲', '해물파전 🥞', '갈비찜 🥘', '수육 🥩',
+        '스테이크 🥩', '피자 🍕', '파스타 🍝',
+    ],
+    'snack': [
+        '치킨 🍗', '피자 🍕', '라면 🍜', '편의점 도시락 🍱',
+        '떡볶이 🌶️', '순대 🌭', '핫도그 🌭', '포장마차 안주 🍢',
+        '야식 치킨 + 맥주 🍺', '컵라면 🍜', '김밥 🍙',
+    ],
+}
+
+
+async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/food [lunch|dinner|snack] → 메뉴 추천."""
+    if not update.message:
+        return
+
+    now_hour = datetime.now(KST).hour
+    if context.args:
+        slot = context.args[0].lower()
+        if slot in ('lunch', 'dinner', 'snack', '점심', '저녁', '야식'):
+            slot = {'점심': 'lunch', '저녁': 'dinner', '야식': 'snack'}.get(slot, slot)
+        else:
+            slot = None
+    else:
+        slot = None
+
+    if slot is None:
+        if 11 <= now_hour < 15:
+            slot = 'lunch'
+        elif 17 <= now_hour < 21:
+            slot = 'dinner'
+        else:
+            slot = 'snack'
+
+    label = {'lunch': '🍱 점심', 'dinner': '🍽️ 저녁', 'snack': '🌙 야식'}[slot]
+    menu  = random.choice(_FOOD_MENUS[slot])
+    await update.message.reply_text(f"{label} 추천\n\n오늘은 {menu} 어떠슈? 😋")
 
 
 # ═══════════════════════════════════════════════════
@@ -2029,7 +2175,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = data.get('chat_id')
     period  = data.get('period', 'morning')
     hours   = 12 if period == 'morning' else 9
-    print(f"[NEWS AUTO SEND] {period} → chat_id={chat_id} hours={hours}")
+    print(f"[NEWS AUTO SEND] chat_id={chat_id} period={period}")
     try:
         text = await asyncio.to_thread(
             news_utils.get_briefing, hours, period, None, True, 8
@@ -2041,11 +2187,15 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-        print(f"[NEWS AUTO SEND] {period} sent OK")
-    except Exception:
-        print(f"[NEWS AUTO SEND] Error sending {period} briefing:")
-        import traceback
-        traceback.print_exc()
+        print(f"[NEWS AUTO SEND] {period} sent OK → chat_id={chat_id}")
+    except Exception as e:
+        err = str(e)
+        if "not enough rights" in err or "bot is not a member" in err or "Forbidden" in err:
+            print(f"[ANNOUNCE SEND ERROR]\nbot has no permission → chat_id={chat_id}")
+        else:
+            print(f"[NEWS AUTO SEND] Error:")
+            import traceback
+            traceback.print_exc()
 
 
 async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2105,7 +2255,7 @@ async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """스케줄러가 매일 05:00 KST에 호출하는 경제 캘린더 자동 발송."""
     data    = context.job.data or {}
     chat_id = data.get('chat_id')
-    print(f"[GC AUTO SEND] → chat_id={chat_id}")
+    print(f"[GC AUTO SEND] chat_id={chat_id}")
     try:
         text = await asyncio.to_thread(calendar_utils.build_calendar_message, False)
         for chunk in _split_message(text):
@@ -2115,11 +2265,15 @@ async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-        print("[GC AUTO SEND] sent OK")
-    except Exception:
-        print("[GC AUTO SEND] Error:")
-        import traceback
-        traceback.print_exc()
+        print(f"[GC AUTO SEND] sent OK → chat_id={chat_id}")
+    except Exception as e:
+        err = str(e)
+        if "not enough rights" in err or "bot is not a member" in err or "Forbidden" in err:
+            print(f"[ANNOUNCE SEND ERROR]\nbot has no permission → chat_id={chat_id}")
+        else:
+            print("[GC AUTO SEND] Error:")
+            import traceback
+            traceback.print_exc()
 
 
 async def kp_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2195,11 +2349,15 @@ async def kp_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             text=text,
             parse_mode="HTML",
         )
-        print(f"[KP AUTO SEND] {period} sent OK")
-    except Exception:
-        print(f"[KP AUTO SEND] Error:")
-        import traceback
-        traceback.print_exc()
+        print(f"[KP AUTO SEND] {period} sent OK → chat_id={chat_id}")
+    except Exception as e:
+        err = str(e)
+        if "not enough rights" in err or "bot is not a member" in err or "Forbidden" in err:
+            print(f"[ANNOUNCE SEND ERROR]\nbot has no permission → chat_id={chat_id}")
+        else:
+            print(f"[KP AUTO SEND] Error:")
+            import traceback
+            traceback.print_exc()
 
 
 async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2257,23 +2415,27 @@ def main() -> None:
     app.add_handler(CommandHandler('au',        cmd_au))
     app.add_handler(CommandHandler('kp',        cmd_kp))
     app.add_handler(CommandHandler('luck',      cmd_luck))
+    app.add_handler(CommandHandler('food',      cmd_food))
     app.add_handler(CommandHandler('news',      cmd_news))
     app.add_handler(CommandHandler('GC',        cmd_calendar))
+    app.add_handler(CommandHandler('sendtest',  cmd_sendtest))
 
-    # 자동 발송 스케줄러 (TARGET_CHAT_ID 환경변수 필요)
-    if TARGET_CHAT_ID and app.job_queue:
+    # 자동 발송 스케줄러 (ANNOUNCE_CHAT_ID 환경변수 필요)
+    if ANNOUNCE_CHAT_ID and app.job_queue:
         try:
-            chat_id_int = int(TARGET_CHAT_ID)
+            chat_id_int = int(ANNOUNCE_CHAT_ID)
             jq = app.job_queue
+
+            print(f"[SCHEDULER STARTED]\ntimezone=Asia/Seoul\nchat_id={ANNOUNCE_CHAT_ID}")
 
             def _register(name, callback, t, data):
                 """기존 동명 job 제거 후 재등록 (재시작 중복 방지)."""
                 for j in jq.get_jobs_by_name(name):
                     j.schedule_removal()
                 jq.run_daily(callback, time=t, data=data, name=name)
+                print(f"[JOB REGISTERED] {name} {t.strftime('%H:%M')}")
 
             # ── 경제 캘린더 ──────────────────────────────
-            # 05:00 KST — 출근길 경제 캘린더
             _register(
                 'gc_morning', calendar_briefing_job,
                 _dt.time(5, 0, 0, tzinfo=KST),
@@ -2281,13 +2443,11 @@ def main() -> None:
             )
 
             # ── 김치프리미엄 ─────────────────────────────
-            # 07:00 KST — 김프 오전 체크
             _register(
                 'kp_morning', kp_briefing_job,
                 _dt.time(7, 0, 0, tzinfo=KST),
                 {'chat_id': chat_id_int, 'period': 'morning'},
             )
-            # 16:00 KST — 김프 오후 체크
             _register(
                 'kp_evening', kp_briefing_job,
                 _dt.time(16, 0, 0, tzinfo=KST),
@@ -2295,32 +2455,26 @@ def main() -> None:
             )
 
             # ── 뉴스 브리핑 ──────────────────────────────
-            # 08:00 KST — 뉴스 오전 브리핑
             _register(
                 'news_morning', news_briefing_job,
                 _dt.time(8, 0, 0, tzinfo=KST),
                 {'chat_id': chat_id_int, 'period': 'morning'},
             )
-            # 17:00 KST — 뉴스 오후 브리핑
             _register(
                 'news_evening', news_briefing_job,
                 _dt.time(17, 0, 0, tzinfo=KST),
                 {'chat_id': chat_id_int, 'period': 'evening'},
             )
 
-            logger.info(
-                "[SCHEDULER] Asia/Seoul | "
-                "05:00 gc_morning | 07:00 kp_morning | 08:00 news_morning | "
-                "16:00 kp_evening | 17:00 news_evening → chat_id=%s",
-                TARGET_CHAT_ID,
-            )
         except ValueError:
-            logger.warning("[SCHEDULER] TARGET_CHAT_ID is not a valid integer: %s", TARGET_CHAT_ID)
-    elif TARGET_CHAT_ID:
+            logger.warning("[SCHEDULER] ANNOUNCE_CHAT_ID is not a valid integer: %s", ANNOUNCE_CHAT_ID)
+    elif ANNOUNCE_CHAT_ID:
         logger.warning(
-            "[SCHEDULER] TARGET_CHAT_ID set but job_queue unavailable. "
+            "[SCHEDULER] ANNOUNCE_CHAT_ID set but job_queue unavailable. "
             "Install: python-telegram-bot[job-queue]"
         )
+    else:
+        logger.warning("[SCHEDULER] ANNOUNCE_CHAT_ID not set — 자동발송 비활성화")
 
     # InlineKeyboard 콜백 핸들러
     app.add_handler(
