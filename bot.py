@@ -203,6 +203,19 @@ class AdManager:
 
 ad_manager = AdManager()
 
+
+def _sanitize_caption(text: str) -> str:
+    """차트 캡션에서 DB에 등록된 차단문구를 모두 제거한다."""
+    try:
+        ban_words = db.get_blocked_words()
+        for word in ban_words:
+            if word:
+                text = text.replace(word, '')
+    except Exception:
+        pass
+    return text.strip()
+
+
 # ── 이전 광고문구 메시지 일괄 정리 ─────────────────────────────────────────
 
 async def cleanup_old_ads(bot) -> None:
@@ -725,11 +738,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    세 가지 모드:
-      [답글 모드]  메시지에 답글로 /bw         → 해당 메시지를 차단 문구로 등록 + 삭제 + mute
-      [광고 설정]  /bw <문구>                  → 광고문구 설정 + 이전 메시지 자동 cleanup
-      [광고 초기화] /bw clear                  → 광고문구 삭제 + 이전 메시지 cleanup
-      [조회]       /bw (인자 없음, 답글 없음)  → 현재 광고문구 출력
+    [답글 모드]  메시지에 답글로 /bw  → 해당 메시지를 스팸 차단문구로 등록 + 삭제 + mute
+    [조회]       /bw (인자 없음)      → 사용법 안내
     """
     if not update.message:
         return
@@ -802,64 +812,13 @@ async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 pass
             return
 
-        # ── 직접 모드: 광고문구 관리 ──────────────────────────────────
-        args_text = ' '.join(context.args).strip() if context.args else ''
-
-        # /bw (인자 없음) → 현재 광고문구 출력
-        if not args_text:
-            cur = ad_manager.get_ad()
-            if cur:
-                await update.message.reply_text(
-                    f"현재 광고문구 (v{ad_manager.version}):\n\n{cur}\n\n"
-                    "/bw 새문구 → 변경   /bw clear → 삭제"
-                )
-            else:
-                await update.message.reply_text(
-                    "현재 설정된 광고문구가 없습니다.\n\n"
-                    "/bw 문구 → 광고문구 설정"
-                )
-            return
-
-        # /bw clear → 광고문구 삭제
-        if args_text.lower() == 'clear':
-            ad_manager.clear_ad()
-            print(f"[BW UPDATE] 광고문구 삭제 → new_version={ad_manager.version}")
-            logger.info("[BW UPDATE] 광고문구 삭제 new_version=%d", ad_manager.version)
-            sent = await update.message.reply_text(
-                f"✅ 광고문구가 삭제되었습니다. (v{ad_manager.version})\n"
-                "이전 메시지 cleanup을 시작합니다..."
-            )
-            asyncio.create_task(cleanup_old_ads(context.bot))
-            try:
-                await update.message.delete()
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-            try:
-                await sent.delete()
-            except Exception:
-                pass
-            return
-
-        # /bw <문구> → 광고문구 설정
-        version = ad_manager.set_ad(args_text)
-        print(f"[BW UPDATE] 광고문구 변경 → new_version={version}")
-        logger.info("[BW UPDATE] 광고문구 변경 new_version=%d text=%r", version, args_text)
-        sent = await update.message.reply_text(
-            f"✅ 광고문구가 설정되었습니다. (v{version})\n\n"
-            f"{args_text}\n\n"
-            "이전 메시지 cleanup을 시작합니다..."
+        # 답글 없이 직접 입력 → 사용법 안내
+        await update.message.reply_text(
+            "📌 /bw 사용법\n\n"
+            "차단할 메시지에 답글을 달고 /bw 를 입력하세요.\n"
+            "해당 메시지가 차단문구로 등록되고 발신자가 mute됩니다.\n\n"
+            "차단문구 목록 확인: /banwords"
         )
-        asyncio.create_task(cleanup_old_ads(context.bot))
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-        await asyncio.sleep(3)
-        try:
-            await sent.delete()
-        except Exception:
-            pass
 
     except Exception as e:
         logger.error("cmd_banword 오류: %s", e)
@@ -1412,17 +1371,11 @@ async def _send_chart_result(
         return
 
     base_caption = result.get('caption') or f"📊 {result['symbol']}  {result['timeframe']}"
-    caption      = ad_manager.build_caption(base_caption)
+    caption      = _sanitize_caption(base_caption)
 
     try:
         with open(result['file_path'], 'rb') as f:
-            sent = await update.message.reply_photo(photo=f, caption=caption)
-        ad_manager.record(
-            chat_id=update.effective_chat.id,
-            message_id=sent.message_id,
-            base_caption=base_caption,
-            msg_type='photo',
-        )
+            await update.message.reply_photo(photo=f, caption=caption)
     except Exception as e:
         logger.error("차트 전송 실패: %s", e)
         await update.message.reply_text(f"차트 전송 실패: {e}")
@@ -1528,16 +1481,10 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             name = result
             print(f"[AK] ticker={ticker} name={name} tf={timeframe}")
             chart_path, base_caption = create_kr_stock_chart(ticker, name, timeframe)
-            caption = ad_manager.build_caption(base_caption)
+            caption = _sanitize_caption(base_caption)
             try:
                 with open(chart_path, 'rb') as f:
-                    sent = await update.message.reply_photo(photo=f, caption=caption)
-                ad_manager.record(
-                    chat_id=update.effective_chat.id,
-                    message_id=sent.message_id,
-                    base_caption=base_caption,
-                    msg_type='photo',
-                )
+                    await update.message.reply_photo(photo=f, caption=caption)
             finally:
                 try:
                     os.remove(chart_path)
@@ -1630,12 +1577,8 @@ _HELP_TEXT = (
     "/news → 글로벌 뉴스 테스트\n"
     "/GC → 경제 캘린더 테스트\n"
     "\n"
-    "📣 광고 / 관리 (관리자)\n"
-    "/bw 문구 → 광고문구 설정\n"
-    "/bw → 현재 광고 확인\n"
-    "/bw clear → 광고 삭제\n"
-    "\n"
-    "🚫 제재 (관리자)\n"
+    "🚫 제재 / 차단 (관리자)\n"
+    "/bw → 메시지에 답글로 차단문구 등록 + mute\n"
     "/mute → 유저 mute\n"
     "/unmute → mute 해제\n"
     "/banwords → 차단 목록\n"
