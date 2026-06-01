@@ -1646,8 +1646,7 @@ _HELP_TEXT = (
     "🔧 기타\n"
     "/help → 도움말\n"
     "/nettest → 서버 테스트\n"
-    "/sendtest → 공지방 발송 테스트 (관리자)\n"
-    "/chatid → 현재 채팅방 ID 확인"
+    "/sendtest → 공지방 발송 테스트 (관리자)"
 )
 
 
@@ -1655,22 +1654,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     await update.message.reply_text(_HELP_TEXT)
-
-
-async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/chatid → 현재 채팅방의 chat_id 출력 (ANNOUNCE_CHAT_ID 설정용)."""
-    if not update.message:
-        return
-    chat = update.effective_chat
-    user = update.effective_user
-    await update.message.reply_text(
-        f"📋 Chat ID 정보\n\n"
-        f"채팅방 ID: {chat.id}\n"
-        f"채팅방 이름: {chat.title or chat.username or '(없음)'}\n"
-        f"채팅방 유형: {chat.type}\n\n"
-        f"내 유저 ID: {user.id}\n\n"
-        f".env 설정:\nANNOUNCE_CHAT_ID={chat.id}"
-    )
 
 
 async def cmd_sendtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2436,7 +2419,6 @@ def main() -> None:
     app.add_handler(CommandHandler('news',      cmd_news))
     app.add_handler(CommandHandler('GC',        cmd_calendar))
     app.add_handler(CommandHandler('sendtest',  cmd_sendtest))
-    app.add_handler(CommandHandler('chatid',    cmd_chatid))
 
     # 자동 발송 스케줄러 (ANNOUNCE_CHAT_ID 환경변수 필요)
     if ANNOUNCE_CHAT_ID and app.job_queue:
