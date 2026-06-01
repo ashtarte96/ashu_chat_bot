@@ -85,7 +85,7 @@ if not TELEGRAM_BOT_TOKEN:
     )
 
 MUTE_HOURS       = 24
-ANNOUNCE_CHAT_ID = os.getenv("ANNOUNCE_CHAT_ID", "")
+ANNOUNCE_CHAT_ID = os.getenv("ANNOUNCE_CHAT_ID", "-1001968443769")
 
 logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -1679,7 +1679,7 @@ async def cmd_sendtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             f"✅ 공지방 테스트 발송 완료\nchat_id={ANNOUNCE_CHAT_ID}"
         )
-        print(f"[SENDTEST] OK → chat_id={ANNOUNCE_CHAT_ID}")
+        print(f"[SENDTEST]\nchat_id={ANNOUNCE_CHAT_ID}")
     except Exception as e:
         err = str(e)
         print(f"[ANNOUNCE SEND ERROR] {err}")
@@ -1699,36 +1699,61 @@ async def cmd_sendtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 _FOOD_MENUS = {
     'lunch': [
-        '김치찌개 🥘', '된장찌개 🍲', '순두부찌개 🍜', '부대찌개 🥘',
-        '제육볶음 🍖', '삼겹살 🥓', '닭갈비 🍗', '냉면 🍜',
-        '비빔밥 🍚', '갈비탕 🍲', '설렁탕 🍲', '곰탕 🍲',
-        '짜장면 🍝', '짬뽕 🍜', '쌀국수 🍜', '돈까스 🍱',
+        ('김치찌개', '🥘', 'kimchi+stew+korean'),
+        ('된장찌개', '🍲', 'doenjang+jjigae+korean'),
+        ('순두부찌개', '🍜', 'korean+soft+tofu+stew'),
+        ('부대찌개', '🥘', 'budae+jjigae+korean+army+stew'),
+        ('제육볶음', '🍖', 'korean+spicy+pork+stir+fry'),
+        ('삼겹살', '🥓', 'samgyeopsal+korean+grilled+pork'),
+        ('닭갈비', '🍗', 'dak+galbi+korean+spicy+chicken'),
+        ('냉면', '🍜', 'naengmyeon+korean+cold+noodles'),
+        ('비빔밥', '🍚', 'bibimbap+korean+rice+bowl'),
+        ('갈비탕', '🍲', 'galbitang+korean+rib+soup'),
+        ('설렁탕', '🍲', 'seolleongtang+korean+ox+bone+soup'),
+        ('짜장면', '🍝', 'jajangmyeon+black+bean+noodles'),
+        ('짬뽕', '🍜', 'jjamppong+korean+spicy+seafood+noodles'),
+        ('쌀국수', '🍜', 'pho+vietnamese+noodle+soup'),
+        ('돈까스', '🍱', 'tonkatsu+pork+cutlet'),
     ],
     'dinner': [
-        '삼겹살 🥓', '치킨 🍗', '갈비구이 🍖', '회 🐟',
-        '초밥 🍣', '보쌈 🥬', '족발 🍖', '곱창 🔥',
-        '삼계탕 🍲', '해물파전 🥞', '갈비찜 🥘', '수육 🥩',
-        '스테이크 🥩', '피자 🍕', '파스타 🍝',
+        ('삼겹살', '🥓', 'samgyeopsal+korean+grilled+pork+belly'),
+        ('치킨', '🍗', 'korean+fried+chicken'),
+        ('갈비구이', '🍖', 'korean+galbi+grilled+ribs'),
+        ('회', '🐟', 'korean+sashimi+fresh+fish'),
+        ('초밥', '🍣', 'sushi+japanese+rolls'),
+        ('보쌈', '🥬', 'bossam+korean+pork+wrapped'),
+        ('족발', '🍖', 'jokbal+korean+braised+pork+feet'),
+        ('삼계탕', '🍲', 'samgyetang+ginseng+chicken+soup'),
+        ('해물파전', '🥞', 'haemul+pajeon+korean+seafood+pancake'),
+        ('갈비찜', '🥘', 'galbijjim+korean+braised+short+ribs'),
+        ('스테이크', '🥩', 'steak+grilled+beef'),
+        ('피자', '🍕', 'pizza+cheese'),
+        ('파스타', '🍝', 'pasta+italian'),
     ],
     'snack': [
-        '치킨 🍗', '피자 🍕', '라면 🍜', '편의점 도시락 🍱',
-        '떡볶이 🌶️', '순대 🌭', '핫도그 🌭', '포장마차 안주 🍢',
-        '야식 치킨 + 맥주 🍺', '컵라면 🍜', '김밥 🍙',
+        ('치킨', '🍗', 'korean+fried+chicken+night'),
+        ('피자', '🍕', 'pizza+delivery'),
+        ('라면', '🍜', 'korean+ramyeon+noodles'),
+        ('떡볶이', '🌶️', 'tteokbokki+korean+spicy+rice+cake'),
+        ('순대', '🌭', 'sundae+korean+blood+sausage'),
+        ('포장마차 안주', '🍢', 'korean+street+food+pojangmacha'),
+        ('야식 치킨 + 맥주', '🍺', 'korean+fried+chicken+beer'),
+        ('컵라면', '🍜', 'cup+noodles+ramen'),
+        ('김밥', '🍙', 'gimbap+korean+rice+rolls'),
     ],
 }
 
 
 async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/food [lunch|dinner|snack] → 메뉴 추천."""
+    """/food [lunch|dinner|snack] → 메뉴 추천 + 사진."""
     if not update.message:
         return
 
     now_hour = datetime.now(KST).hour
     if context.args:
         slot = context.args[0].lower()
-        if slot in ('lunch', 'dinner', 'snack', '점심', '저녁', '야식'):
-            slot = {'점심': 'lunch', '저녁': 'dinner', '야식': 'snack'}.get(slot, slot)
-        else:
+        slot = {'점심': 'lunch', '저녁': 'dinner', '야식': 'snack'}.get(slot, slot)
+        if slot not in ('lunch', 'dinner', 'snack'):
             slot = None
     else:
         slot = None
@@ -1741,9 +1766,15 @@ async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             slot = 'snack'
 
-    label = {'lunch': '🍱 점심', 'dinner': '🍽️ 저녁', 'snack': '🌙 야식'}[slot]
-    menu  = random.choice(_FOOD_MENUS[slot])
-    await update.message.reply_text(f"{label} 추천\n\n오늘은 {menu} 어떠슈? 😋")
+    label   = {'lunch': '🍱 점심', 'dinner': '🍽️ 저녁', 'snack': '🌙 야식'}[slot]
+    name, emoji, keyword = random.choice(_FOOD_MENUS[slot])
+    caption = f"{label} 추천\n\n오늘은 {name} {emoji} 어떠슈? 😋"
+
+    photo_url = f"https://source.unsplash.com/400x300/?{keyword}"
+    try:
+        await update.message.reply_photo(photo=photo_url, caption=caption)
+    except Exception:
+        await update.message.reply_text(caption)
 
 
 # ═══════════════════════════════════════════════════
@@ -1965,7 +1996,7 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             text=(
                 f"🤖 [{name_str}] 님 환영합니다!\n\n"
                 f"🧮 인증 문제: {question} = ?\n\n"
-                "⏱ 10초 안에 정답 버튼을 눌러주세요.\n"
+                "⏱ 30초 안에 정답 버튼을 눌러주세요.\n"
                 "시간 초과 시 자동 퇴장 처리됩니다."
             ),
             reply_markup=keyboard,
@@ -1985,8 +2016,8 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def _verification_timeout(bot, chat_id: int, user_id: int, msg_id: int) -> None:
-    """10초 후 인증 미완료 시 퇴장 처리."""
-    await asyncio.sleep(10)
+    """30초 후 인증 미완료 시 퇴장 처리."""
+    await asyncio.sleep(30)
     if user_id not in _pending_verification:
         return   # 이미 인증 완료
 
@@ -2175,7 +2206,7 @@ async def news_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = data.get('chat_id')
     period  = data.get('period', 'morning')
     hours   = 12 if period == 'morning' else 9
-    print(f"[NEWS AUTO SEND] chat_id={chat_id} period={period}")
+    print(f"[NEWS AUTO SEND]\nchat_id={chat_id} period={period}")
     try:
         text = await asyncio.to_thread(
             news_utils.get_briefing, hours, period, None, True, 8
@@ -2255,7 +2286,7 @@ async def calendar_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """스케줄러가 매일 05:00 KST에 호출하는 경제 캘린더 자동 발송."""
     data    = context.job.data or {}
     chat_id = data.get('chat_id')
-    print(f"[GC AUTO SEND] chat_id={chat_id}")
+    print(f"[GC AUTO SEND]\nchat_id={chat_id}")
     try:
         text = await asyncio.to_thread(calendar_utils.build_calendar_message, False)
         for chunk in _split_message(text):
@@ -2282,7 +2313,7 @@ async def kp_briefing_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = data.get('chat_id')
     period  = data.get('period', 'morning')
     header  = "🐰 아슈 김프 오전 체크" if period == 'morning' else "🐰 아슈 김프 오후 체크"
-    print(f"[KP AUTO SEND] {period} → chat_id={chat_id}")
+    print(f"[KP AUTO SEND]\nchat_id={chat_id} period={period}")
     try:
         results = await asyncio.gather(
             asyncio.to_thread(_fetch_usdkrw),
@@ -2426,7 +2457,8 @@ def main() -> None:
             chat_id_int = int(ANNOUNCE_CHAT_ID)
             jq = app.job_queue
 
-            print(f"[SCHEDULER STARTED]\ntimezone=Asia/Seoul\nchat_id={ANNOUNCE_CHAT_ID}")
+            print(f"[ANNOUNCE CHAT]\nid={ANNOUNCE_CHAT_ID}")
+            print(f"[SCHEDULER STARTED]\ntimezone=Asia/Seoul")
 
             def _register(name, callback, t, data):
                 """기존 동명 job 제거 후 재등록 (재시작 중복 방지)."""
