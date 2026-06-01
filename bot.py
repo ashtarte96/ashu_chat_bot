@@ -1699,47 +1699,47 @@ async def cmd_sendtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 _FOOD_MENUS = {
     'lunch': [
-        ('김치찌개', '🥘', 'kimchi,stew'),
-        ('된장찌개', '🍲', 'miso,soup,korean'),
-        ('순두부찌개', '🍜', 'tofu,soup,korean'),
-        ('부대찌개', '🥘', 'stew,sausage,korean'),
-        ('제육볶음', '🍖', 'pork,spicy,korean'),
-        ('삼겹살', '🥓', 'pork,belly,grilled'),
-        ('닭갈비', '🍗', 'chicken,spicy,korean'),
-        ('냉면', '🍜', 'cold,noodles,korean'),
-        ('비빔밥', '🍚', 'bibimbap,rice,korean'),
-        ('갈비탕', '🍲', 'ribs,soup,korean'),
-        ('설렁탕', '🍲', 'bone,soup,korean'),
-        ('짜장면', '🍝', 'noodles,blackbean,chinese'),
-        ('짬뽕', '🍜', 'seafood,noodles,spicy'),
-        ('쌀국수', '🍜', 'pho,noodle,soup'),
-        ('돈까스', '🍱', 'tonkatsu,pork,cutlet'),
+        ('김치찌개', '🥘', '한 그릇이면 오전 피로가 조용해짐.'),
+        ('된장찌개', '🍲', '구수함이 속을 잡아줌. 밥도둑 확정.'),
+        ('순두부찌개', '🍜', '부드럽고 얼큰하게 하루 시작.'),
+        ('부대찌개', '🥘', '햄이랑 소시지가 하루의 피로를 대신 맞아줌.'),
+        ('제육볶음', '🔥', '맵단짠이면 웬만한 고민은 잠깐 조용해짐.'),
+        ('삼겹살', '🥓', '낮부터 고기면 하루가 이미 성공임.'),
+        ('닭갈비', '🍗', '매콤달콤하게 정신 차리는 점심.'),
+        ('냉면', '🍜', '시원하고 쫄깃하게 점심 한 방.'),
+        ('비빔밥', '🍚', '다 넣고 비비면 그게 답임.'),
+        ('갈비탕', '🍲', '뼈에서 우러난 깊은 맛. 든든함 보장.'),
+        ('설렁탕', '🍲', '뽀얀 국물 한 그릇이면 속이 안정됨.'),
+        ('짜장면', '🍝', '검은 소스가 모든 걸 해결해줌.'),
+        ('짬뽕', '🍜', '불맛 국물로 정신 바짝 차리는 점심.'),
+        ('쌀국수', '🍜', '가볍고 개운하게. 몸이 고마워함.'),
+        ('돈까스', '🍱', '바삭함이 기분까지 바꿔줌.'),
     ],
     'dinner': [
-        ('삼겹살', '🥓', 'pork,belly,bbq'),
-        ('치킨', '🍗', 'fried,chicken,crispy'),
-        ('갈비구이', '🍖', 'ribs,grilled,korean'),
-        ('회', '🐟', 'sashimi,fish,fresh'),
-        ('초밥', '🍣', 'sushi,japanese'),
-        ('보쌈', '🥬', 'pork,lettuce,wrap'),
-        ('족발', '🍖', 'braised,pork,korean'),
-        ('삼계탕', '🍲', 'chicken,ginseng,soup'),
-        ('해물파전', '🥞', 'seafood,pancake,korean'),
-        ('갈비찜', '🥘', 'ribs,braised,korean'),
-        ('스테이크', '🥩', 'steak,beef,grilled'),
-        ('피자', '🍕', 'pizza,cheese'),
-        ('파스타', '🍝', 'pasta,italian'),
+        ('삼겹살', '🥓', '퇴근 후엔 고기가 답임. 이견 없음.'),
+        ('치킨', '🍗', '바삭하고 촉촉하게 하루 마무리.'),
+        ('갈비구이', '🍖', '연기 자욱한 불판 앞에서 힐링.'),
+        ('회', '🐟', '신선한 바다 맛으로 하루 보상.'),
+        ('초밥', '🍣', '입 안에서 녹으면 스트레스도 같이 녹음.'),
+        ('보쌈', '🥬', '쌈 싸먹는 순간 하루 리셋됨.'),
+        ('족발', '🍖', '쫀득함이 취한 듯 나를 위로해줌.'),
+        ('삼계탕', '🍲', '몸이 지쳤을 때 닭 한 마리가 진리임.'),
+        ('해물파전', '🥞', '막걸리 한 잔이랑 찰떡 궁합.'),
+        ('갈비찜', '🥘', '입에서 살살 녹는 진짜 저녁.'),
+        ('스테이크', '🥩', '오늘만큼은 나 자신에게 투자.'),
+        ('피자', '🍕', '치즈가 늘어나면 기분도 늘어남.'),
+        ('파스타', '🍝', '이탈리아 감성으로 저녁 마무리.'),
     ],
     'snack': [
-        ('치킨', '🍗', 'fried,chicken,night'),
-        ('피자', '🍕', 'pizza,delivery'),
-        ('라면', '🍜', 'ramen,noodles'),
-        ('떡볶이', '🌶️', 'rice,cake,spicy,korean'),
-        ('순대', '🌭', 'sausage,street,korean'),
-        ('포장마차 안주', '🍢', 'street,food,korean'),
-        ('야식 치킨 + 맥주', '🍺', 'chicken,beer'),
-        ('컵라면', '🍜', 'cup,noodles,ramen'),
-        ('김밥', '🍙', 'gimbap,rice,roll'),
+        ('치킨', '🍗', '야식의 정석. 더 설명 필요 없음.'),
+        ('피자', '🍕', '밤에 먹는 피자는 왜 더 맛있는지 모름.'),
+        ('라면', '🍜', '끓이는 3분이 제일 설레는 시간임.'),
+        ('떡볶이', '🌶️', '매운맛으로 하루 리셋 들어가야 함.'),
+        ('순대', '🌭', '어묵이랑 같이면 포장마차 그 감성.'),
+        ('포장마차 안주', '🍢', '오뎅 국물 한 잔이면 위로 완료.'),
+        ('야식 치킨 + 맥주', '🍺', '치맥은 밤의 공식임. 논쟁 사절.'),
+        ('컵라면', '🍜', '뚜껑 열고 3분. 인생 가장 짧은 행복.'),
+        ('김밥', '🍙', '한 줄이면 충분함. 두 줄이면 더 좋음.'),
     ],
 }
 
@@ -1766,15 +1766,9 @@ async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             slot = 'snack'
 
-    label   = {'lunch': '🍱 점심', 'dinner': '🍽️ 저녁', 'snack': '🌙 야식'}[slot]
-    name, emoji, keyword = random.choice(_FOOD_MENUS[slot])
-    caption = f"{label} 추천\n\n오늘은 {name} {emoji} 어떠슈? 😋"
-
-    photo_url = f"https://loremflickr.com/400/300/{keyword}?random={random.randint(1, 9999)}"
-    try:
-        await update.message.reply_photo(photo=photo_url, caption=caption)
-    except Exception:
-        await update.message.reply_text(caption)
+    label = {'lunch': '🍚 오늘의 점메추', 'dinner': '🍽 오늘의 저메추', 'snack': '🌙 오늘의 야식 추천'}[slot]
+    name, emoji, desc = random.choice(_FOOD_MENUS[slot])
+    await update.message.reply_text(f"{label}\n\n오늘은 {name} 어떠슈? {emoji}\n{desc}")
 
 
 # ═══════════════════════════════════════════════════
