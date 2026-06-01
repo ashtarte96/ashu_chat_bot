@@ -1770,7 +1770,8 @@ async def cmd_food(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name, emoji, keyword = random.choice(_FOOD_MENUS[slot])
     caption = f"{label} 추천\n\n오늘은 {name} {emoji} 어떠슈? 😋"
 
-    photo_url = f"https://source.unsplash.com/400x300/?{keyword}"
+    # loremflickr: 무료 키워드 기반 이미지 서비스 (Unsplash Source deprecated 대체)
+    photo_url = f"https://loremflickr.com/400/300/{keyword}"
     try:
         await update.message.reply_photo(photo=photo_url, caption=caption)
     except Exception:
