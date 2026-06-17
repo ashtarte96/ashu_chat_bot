@@ -104,6 +104,84 @@ db = Database()
 
 _AD_STATE_FILE  = 'ad_state.json'
 _SENT_MSGS_FILE = 'sent_messages.json'
+_SPAM_STRIKES_FILE = 'spam_strikes.json'
+
+
+# ── 스팸 strike 관리 ──────────────────────────────────────────────────────────
+
+class SpamStrikeManager:
+    def __init__(self):
+        self._data: dict = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(_SPAM_STRIKES_FILE, 'r', encoding='utf-8') as f:
+                self._data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._data = {}
+
+    def _save(self):
+        try:
+            with open(_SPAM_STRIKES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error("[SPAM STRIKE] save failed: %s", e)
+
+    @staticmethod
+    def _key(chat_id: int, user_id: int) -> str:
+        return f"{chat_id}:{user_id}"
+
+    def _cutoff_dt(self) -> datetime:
+        return datetime.now(timezone.utc) - timedelta(hours=24)
+
+    def _clean_old(self, key: str) -> list:
+        """24시간 지난 strike 제거 후 남은 목록 반환."""
+        if key not in self._data:
+            return []
+        cutoff = self._cutoff_dt()
+        valid = []
+        for ts in self._data[key]:
+            try:
+                dt = datetime.fromisoformat(ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=KST)
+                if dt.astimezone(timezone.utc) >= cutoff:
+                    valid.append(ts)
+            except Exception:
+                pass
+        if valid:
+            self._data[key] = valid
+        else:
+            self._data.pop(key, None)
+        return valid
+
+    def add_strike(self, chat_id: int, user_id: int) -> int:
+        key = self._key(chat_id, user_id)
+        valid = self._clean_old(key)
+        valid.append(datetime.now(KST).isoformat())
+        self._data[key] = valid
+        self._save()
+        count = len(valid)
+        logger.info("[SPAM STRIKE] chat=%d user=%d count=%d", chat_id, user_id, count)
+        return count
+
+    def get_count(self, chat_id: int, user_id: int) -> int:
+        key = self._key(chat_id, user_id)
+        return len(self._clean_old(key))
+
+    def clear(self, chat_id: int, user_id: int) -> None:
+        key = self._key(chat_id, user_id)
+        self._data.pop(key, None)
+        self._save()
+        logger.info("[STRIKE CLEANUP] chat=%d user=%d cleared", chat_id, user_id)
+
+    def get_timestamps(self, chat_id: int, user_id: int) -> list:
+        key = self._key(chat_id, user_id)
+        return list(self._clean_old(key))
+
+
+spam_strikes = SpamStrikeManager()
 
 
 class AdManager:
@@ -537,6 +615,38 @@ def _captcha_keyboard(user_id: int, answer: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([buttons[:2], buttons[2:]])
 
 
+# ── 비한국 계정 한국어 인증 문제 ─────────────────────────────────────────────
+
+_KOREAN_QUESTIONS: list[dict] = [
+    {
+        'question': '사과는 영어로 apple입니다. 사과는 무슨 색인가요?',
+        'answers':  ['빨강', '빨간색', 'red'],
+    },
+    {
+        'question': '한국의 수도는 어디인가요?',
+        'answers':  ['서울', 'seoul'],
+    },
+    {
+        'question': '하늘은 보통 무슨 색인가요?',
+        'answers':  ['파랑', '파란색', 'blue'],
+    },
+    {
+        'question': '1월 다음 달은 몇 월인가요?',
+        'answers':  ['2월', '이월', '2'],
+    },
+    {
+        'question': '고양이는 어떤 소리를 내나요?',
+        'answers':  ['야옹', 'meow'],
+    },
+]
+
+
+def _make_korean_quiz() -> tuple[str, list[str]]:
+    """랜덤 한국어 인증 문제 반환. (question, answer_list) 튜플."""
+    q = random.choice(_KOREAN_QUESTIONS)
+    return q['question'], list(q['answers'])
+
+
 # ═══════════════════════════════════════════════════
 # 유틸리티 함수
 # ═══════════════════════════════════════════════════
@@ -659,6 +769,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     print(f"[CHECK MESSAGE] chat={msg.chat_id} user={user.id} text={text[:80]}")
 
+    # ── 한국어 인증 응답 처리 ─────────────────────────
+    if user.id in _pending_verification:
+        entry = _pending_verification.get(user.id)
+        if entry and entry.get('step') == 'korean' and entry.get('chat_id') == msg.chat_id:
+            normalized = text.strip().replace(' ', '').lower()
+            valid = [a.replace(' ', '').lower() for a in entry.get('korean_answer_list', [])]
+
+            if normalized in valid:
+                # 정답 → 전체 제한 해제
+                entry['task'].cancel()
+                del _pending_verification[user.id]
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat_id=msg.chat_id,
+                        user_id=user.id,
+                        permissions=_FULL_PERMISSIONS,
+                    )
+                except Exception as e:
+                    logger.error("[VERIFY] korean full restore failed user=%d: %s", user.id, e)
+                try:
+                    await context.bot.delete_message(msg.chat_id, entry['msg_id'])
+                except Exception:
+                    pass
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                try:
+                    notice = await context.bot.send_message(
+                        msg.chat_id, "✅ 인증이 완료되었습니다. 환영합니다!"
+                    )
+                    await asyncio.sleep(5)
+                    await notice.delete()
+                except Exception:
+                    pass
+                logger.info("[VERIFY] user=%d result=success (korean step)", user.id)
+            else:
+                # 오답 → 안내 후 재시도 허용 (타이머 유지)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                try:
+                    wrong = await context.bot.send_message(
+                        msg.chat_id,
+                        f"❌ 틀렸습니다. 다시 시도하세요.\n\n📝 문제: {entry['korean_question']}"
+                    )
+                    await asyncio.sleep(3)
+                    await wrong.delete()
+                except Exception:
+                    pass
+                logger.info("[VERIFY] user=%d wrong korean answer=%r", user.id, text[:50])
+            return  # 인증 처리 완료 — 스팸 검사·카운트 건너뜀
+
     # ── 차단 문구 검사 ─────────────────────────────
     try:
         blocked_words = db.get_blocked_words()
@@ -719,6 +883,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         except Exception as exc:
             logger.warning("알림 메시지 전송 실패: %s", exc)
+
+        # 스팸 strike 누적 + 3회 이상 자동추방
+        strike_count = spam_strikes.add_strike(msg.chat_id, user.id)
+        if strike_count >= 3:
+            await _auto_kick_if_needed(
+                context.bot, msg.chat_id, user.id, strike_count, make_display_name(user)
+            )
 
         return  # 스팸 메시지는 카운트하지 않음
 
@@ -798,6 +969,12 @@ async def cmd_banword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         )
                         print(f"[SPAM USER MUTED] user={reply_msg.from_user.id}")
                         result_msg += "\n원본 메시지 삭제 및 사용자 mute 완료"
+                        strike_count = spam_strikes.add_strike(update.effective_chat.id, reply_msg.from_user.id)
+                        if strike_count >= 3:
+                            await _auto_kick_if_needed(
+                                context.bot, update.effective_chat.id, reply_msg.from_user.id,
+                                strike_count, make_display_name(reply_msg.from_user),
+                            )
                 except Exception as e:
                     result_msg += f"\n사용자 mute 실패: {e}"
 
@@ -1101,6 +1278,14 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         print(f"[MUTED] user={target_user.id} duration={duration}")
 
+        # 스팸 strike 누적 (관리자 수동 mute)
+        strike_count = spam_strikes.add_strike(update.effective_chat.id, target_user.id)
+        if strike_count >= 3:
+            await _auto_kick_if_needed(
+                context.bot, update.effective_chat.id, target_user.id,
+                strike_count, make_display_name(target_user),
+            )
+
         # 시간 표시 문자열
         total_seconds = int(duration.total_seconds())
         if total_seconds < 3600:
@@ -1206,6 +1391,331 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as e:
         logger.error("cmd_unmute 오류: %s", e)
         await update.message.reply_text(f"오류 발생: {e}")
+
+
+# ═══════════════════════════════════════════════════
+# 스팸 자동추방 헬퍼
+# ═══════════════════════════════════════════════════
+
+async def _auto_kick_if_needed(
+    bot,
+    chat_id: int,
+    user_id: int,
+    count: int,
+    display_name: str = '',
+) -> bool:
+    """strike >= 3이면 자동 추방. 관리자/봇은 제외. 추방 성공 시 True."""
+    if count < 3:
+        return False
+
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        if m.status in ('administrator', 'creator'):
+            return False
+        if hasattr(m, 'user') and m.user.is_bot:
+            return False
+    except Exception:
+        pass
+
+    try:
+        await bot.ban_chat_member(chat_id, user_id)
+        await asyncio.sleep(0.3)
+        await bot.unban_chat_member(chat_id, user_id)
+        spam_strikes.clear(chat_id, user_id)
+        logger.info("[AUTO KICK] chat=%d user=%d strikes=%d name=%s",
+                    chat_id, user_id, count, display_name)
+
+        label = f" ({display_name})" if display_name else ''
+        try:
+            notice = await bot.send_message(
+                chat_id,
+                f"🚫 스팸 누적 3회로 자동 추방했습니다.{label}",
+            )
+            await asyncio.sleep(5)
+            await notice.delete()
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.error("[AUTO KICK] failed chat=%d user=%d: %s", chat_id, user_id, e)
+        return False
+
+
+# ═══════════════════════════════════════════════════
+# /verify_on · /verify_off · /verify_status (관리자 전용)
+# ═══════════════════════════════════════════════════
+
+async def cmd_verify_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "❌ 관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    db.set_math_verify_enabled(chat_id, True)
+    logger.info("[VERIFY TOGGLE] chat=%d enabled=True by user=%d", chat_id, update.effective_user.id)
+    sent = await update.message.reply_text("✅ 신규 입장자 수학 인증이 활성화되었습니다.")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await asyncio.sleep(3)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
+
+
+async def cmd_verify_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "❌ 관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    db.set_math_verify_enabled(chat_id, False)
+    logger.info("[VERIFY TOGGLE] chat=%d enabled=False by user=%d", chat_id, update.effective_user.id)
+    sent = await update.message.reply_text("✅ 신규 입장자 수학 인증이 비활성화되었습니다.")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await asyncio.sleep(3)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
+
+
+async def cmd_verify_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "❌ 관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    enabled = db.get_math_verify_enabled(chat_id)
+    status_str = "ON" if enabled else "OFF"
+    sent = await update.message.reply_text(f"📊 수학 인증 상태 : {status_str}")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await asyncio.sleep(5)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════
+# /kick · /unkick (관리자 전용)
+# ═══════════════════════════════════════════════════
+
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /kick         → 답글 대상 유저 추방 (ban + 즉시 unban)
+    /kick user_id → 해당 user_id 추방
+    """
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    reply_msg = update.message.reply_to_message
+    target_user_id = None
+    target_name = ''
+
+    if reply_msg and reply_msg.from_user:
+        target_user_id = reply_msg.from_user.id
+        target_name = make_display_name(reply_msg.from_user)
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("형식: /kick user_id (숫자) 또는 메시지에 답글로 /kick")
+            return
+    else:
+        await update.message.reply_text("형식: /kick user_id 또는 메시지에 답글로 /kick")
+        return
+
+    try:
+        m = await context.bot.get_chat_member(chat_id, target_user_id)
+        if m.status in ('administrator', 'creator'):
+            await update.message.reply_text("관리자는 추방할 수 없습니다.")
+            return
+        if hasattr(m, 'user') and m.user.is_bot:
+            await update.message.reply_text("봇은 추방할 수 없습니다.")
+            return
+    except Exception:
+        pass
+
+    try:
+        await context.bot.ban_chat_member(chat_id, target_user_id)
+        await asyncio.sleep(0.3)
+        await context.bot.unban_chat_member(chat_id, target_user_id)
+        logger.info("[USER KICK] chat=%d user=%d name=%s by=%d",
+                    chat_id, target_user_id, target_name, update.effective_user.id)
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        sent = await context.bot.send_message(chat_id, "✅ 유저를 추방했습니다.")
+        await asyncio.sleep(3)
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("[USER KICK] failed chat=%d user=%d: %s", chat_id, target_user_id, e)
+        await update.message.reply_text(f"추방 실패: {e}")
+
+
+async def cmd_unkick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /unkick         → 답글 대상 유저 차단 해제
+    /unkick user_id → 해당 user_id 차단 해제
+    """
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    reply_msg = update.message.reply_to_message
+    target_user_id = None
+
+    if reply_msg and reply_msg.from_user:
+        target_user_id = reply_msg.from_user.id
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("형식: /unkick user_id (숫자) 또는 메시지에 답글로 /unkick")
+            return
+    else:
+        await update.message.reply_text("형식: /unkick user_id 또는 메시지에 답글로 /unkick")
+        return
+
+    try:
+        await context.bot.unban_chat_member(chat_id, target_user_id)
+        logger.info("[USER UNKICK] chat=%d user=%d by=%d",
+                    chat_id, target_user_id, update.effective_user.id)
+
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        sent = await context.bot.send_message(chat_id, "✅ 유저 차단을 해제했습니다.")
+        await asyncio.sleep(3)
+        try:
+            await sent.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("[USER UNKICK] failed chat=%d user=%d: %s", chat_id, target_user_id, e)
+        await update.message.reply_text(f"차단 해제 실패: {e}")
+
+
+# ═══════════════════════════════════════════════════
+# /strikes · /clearstrikes (관리자 전용)
+# ═══════════════════════════════════════════════════
+
+async def cmd_strikes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /strikes         → 답글 대상 유저 strike 확인
+    /strikes user_id → 해당 유저 strike 확인
+    """
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    reply_msg = update.message.reply_to_message
+    target_user_id = None
+
+    if reply_msg and reply_msg.from_user:
+        target_user_id = reply_msg.from_user.id
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("형식: /strikes user_id 또는 메시지에 답글로 /strikes")
+            return
+    else:
+        await update.message.reply_text("형식: /strikes user_id 또는 메시지에 답글로 /strikes")
+        return
+
+    count = spam_strikes.get_count(chat_id, target_user_id)
+    timestamps = spam_strikes.get_timestamps(chat_id, target_user_id)
+
+    lines = [f"🔍 유저 {target_user_id} 스팸 strike (최근 24시간): {count}회"]
+    for i, ts in enumerate(timestamps, 1):
+        lines.append(f"  {i}. {ts}")
+
+    sent = await update.message.reply_text('\n'.join(lines))
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await asyncio.sleep(10)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
+
+
+async def cmd_clearstrikes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /clearstrikes         → 답글 대상 유저 strike 초기화
+    /clearstrikes user_id → 해당 유저 strike 초기화
+    """
+    if not update.message:
+        return
+
+    if not await check_is_admin(update, context):
+        await send_temp(update, context, "관리자만 사용할 수 있습니다.")
+        return
+
+    chat_id = update.effective_chat.id
+    reply_msg = update.message.reply_to_message
+    target_user_id = None
+
+    if reply_msg and reply_msg.from_user:
+        target_user_id = reply_msg.from_user.id
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("형식: /clearstrikes user_id 또는 메시지에 답글로 /clearstrikes")
+            return
+    else:
+        await update.message.reply_text("형식: /clearstrikes user_id 또는 메시지에 답글로 /clearstrikes")
+        return
+
+    spam_strikes.clear(chat_id, target_user_id)
+    sent = await update.message.reply_text(f"✅ 유저 {target_user_id} 스팸 strike가 초기화되었습니다.")
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await asyncio.sleep(3)
+    try:
+        await sent.delete()
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════
@@ -1636,9 +2146,17 @@ _HELP_TEXT = (
     "/dw 문구 → 차단 문구 삭제\n"
     "/mute → 유저 mute\n"
     "/unmute → mute 해제\n"
+    "/kick → 유저 추방\n"
+    "/unkick → 추방 해제\n"
+    "/verify_on → 입장 인증 켜기\n"
+    "/verify_off → 입장 인증 끄기\n"
+    "/verify_status → 입장 인증 상태\n"
+    "/strikes → 스팸 누적 확인\n"
+    "/clearstrikes → 스팸 누적 초기화\n"
     "\n"
     "🔒 자동 기능\n"
-    "• 신규 입장자 수학 인증\n"
+    "• 신규 입장자 수학 인증 (ON/OFF 가능)\n"
+    "• 스팸 24시간 3회 누적 자동추방\n"
     "• 뉴스 자동발송: 오전 8시 / 오후 5시\n"
     "• 김프 자동발송: 오전 7시 / 오후 4시\n"
     "• 경제캘린더 자동발송: 오전 5시\n"
@@ -1946,6 +2464,9 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not msg or not msg.new_chat_members:
         return
 
+    if not db.get_math_verify_enabled(msg.chat_id):
+        return
+
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
@@ -1980,6 +2501,9 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except Exception:
                 pass
 
+        # language_code로 한국 계정 여부 판별 ("ko" 외 전부 비한국 계정으로 처리)
+        korean_required = (member.language_code or '').lower() != 'ko'
+
         # 문제 생성 + 메시지 전송
         question, answer = _make_captcha()
         keyboard  = _captcha_keyboard(user_id, answer)
@@ -2000,13 +2524,18 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             _verification_timeout(context.bot, chat_id, user_id, sent.message_id)
         )
         _pending_verification[user_id] = {
-            'chat_id':  chat_id,
-            'answer':   answer,
-            'question': question,
-            'task':     task,
-            'msg_id':   sent.message_id,
+            'chat_id':            chat_id,
+            'answer':             answer,
+            'question':           question,
+            'korean_required':    korean_required,
+            'korean_answer_list': [],
+            'korean_question':    '',
+            'step':               'math',
+            'task':               task,
+            'msg_id':             sent.message_id,
         }
-        logger.info("[VERIFY] user=%d question=%s", user_id, question)
+        logger.info("[VERIFY] user=%d lang=%s korean_required=%s question=%s",
+                    user_id, member.language_code, korean_required, question)
 
 
 async def _verification_timeout(bot, chat_id: int, user_id: int, msg_id: int) -> None:
@@ -2073,24 +2602,62 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if clicked == entry['answer']:
-        # 정답 → 제한 해제 + 환영
         entry['task'].cancel()
-        del _pending_verification[target_uid]
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=entry['chat_id'],
-                user_id=target_uid,
-                permissions=_FULL_PERMISSIONS,
-            )
-        except Exception as e:
-            logger.error("[VERIFY] restore permissions failed user=%d: %s", target_uid, e)
 
-        name_str = query.from_user.first_name or str(target_uid)
-        try:
-            await query.edit_message_text(f"✅ {name_str} 님, 인증 완료! 환영합니다 🎉")
-        except Exception:
-            pass
-        logger.info("[VERIFY] user=%d result=success", target_uid)
+        if not entry.get('korean_required'):
+            # 한국 계정(language_code=="ko") → 수학만으로 인증 완료
+            del _pending_verification[target_uid]
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=entry['chat_id'],
+                    user_id=target_uid,
+                    permissions=_FULL_PERMISSIONS,
+                )
+            except Exception as e:
+                logger.error("[VERIFY] restore permissions failed user=%d: %s", target_uid, e)
+
+            try:
+                await query.edit_message_text("✅ 인증이 완료되었습니다. 환영합니다!")
+            except Exception:
+                pass
+            logger.info("[VERIFY] user=%d result=success (korean account)", target_uid)
+
+        else:
+            # 비한국 계정 → 한국어 인증 단계로 전환
+            korean_question, korean_answers = _make_korean_quiz()
+            entry['step']               = 'korean'
+            entry['korean_question']    = korean_question
+            entry['korean_answer_list'] = korean_answers
+
+            # 텍스트 입력 허용 (채팅 제한 부분 해제)
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=entry['chat_id'],
+                    user_id=target_uid,
+                    permissions=ChatPermissions(can_send_messages=True),
+                )
+            except Exception as e:
+                logger.error("[VERIFY] partial unmute failed user=%d: %s", target_uid, e)
+
+            # 수학 인증 메시지를 한국어 문제로 교체
+            try:
+                await query.edit_message_text(
+                    f"✅ 수학 인증 통과!\n\n"
+                    f"🇰🇷 한국어 추가 인증이 필요합니다.\n\n"
+                    f"📝 문제: {korean_question}\n\n"
+                    "⏱ 30초 안에 채팅창에 답을 입력해주세요."
+                )
+            except Exception:
+                pass
+
+            # 동일 메시지 id 유지 + 새 30초 타임아웃 생성
+            entry['msg_id'] = query.message.message_id
+            entry['task'] = asyncio.create_task(
+                _verification_timeout(
+                    context.bot, entry['chat_id'], target_uid, query.message.message_id
+                )
+            )
+            logger.info("[VERIFY] user=%d step=math→korean question=%s", target_uid, korean_question)
 
     else:
         # 오답 → 새 문제로 교체 (타이머 유지)
@@ -2430,9 +2997,16 @@ def main() -> None:
     app.add_handler(CommandHandler('bw',        cmd_banword))
     app.add_handler(CommandHandler('banwords',  cmd_banwords))
     app.add_handler(CommandHandler('dw',        cmd_delword))
-    app.add_handler(CommandHandler('mute',      cmd_mute))
-    app.add_handler(CommandHandler('unmute',    cmd_unmute))
-    app.add_handler(CommandHandler('help',      cmd_help))
+    app.add_handler(CommandHandler('mute',          cmd_mute))
+    app.add_handler(CommandHandler('unmute',        cmd_unmute))
+    app.add_handler(CommandHandler('kick',          cmd_kick))
+    app.add_handler(CommandHandler('unkick',        cmd_unkick))
+    app.add_handler(CommandHandler('verify_on',     cmd_verify_on))
+    app.add_handler(CommandHandler('verify_off',    cmd_verify_off))
+    app.add_handler(CommandHandler('verify_status', cmd_verify_status))
+    app.add_handler(CommandHandler('strikes',       cmd_strikes))
+    app.add_handler(CommandHandler('clearstrikes',  cmd_clearstrikes))
+    app.add_handler(CommandHandler('help',          cmd_help))
     app.add_handler(CommandHandler('nettest',   cmd_nettest))
     app.add_handler(CommandHandler('ac',        cmd_ac))
     app.add_handler(CommandHandler('ap',        cmd_ap))

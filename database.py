@@ -55,6 +55,12 @@ class Database:
                     created_at TEXT NOT NULL
                 )
             ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS bot_settings (
+                    chat_id             INTEGER PRIMARY KEY,
+                    math_verify_enabled INTEGER NOT NULL DEFAULT 0
+                )
+            ''')
             conn.commit()
         logger.info("DB 초기화 완료: %s", self.db_path)
 
@@ -209,6 +215,31 @@ class Database:
                 'SELECT word FROM blocked_words ORDER BY id'
             )
             return [row[0] for row in cur.fetchall()]
+
+    # ──────────────────────────────────────────
+    # 봇 설정 (그룹별 math_verify)
+    # ──────────────────────────────────────────
+
+    def get_math_verify_enabled(self, chat_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT math_verify_enabled FROM bot_settings WHERE chat_id = ?',
+                (chat_id,),
+            ).fetchone()
+            return bool(row[0]) if row else False
+
+    def set_math_verify_enabled(self, chat_id: int, enabled: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO bot_settings (chat_id, math_verify_enabled)
+                VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET math_verify_enabled = excluded.math_verify_enabled
+                ''',
+                (chat_id, int(enabled)),
+            )
+            conn.commit()
+        logger.info("bot_settings chat_id=%d math_verify_enabled=%s", chat_id, enabled)
 
     def get_blocked_words_with_ids(self) -> List[Tuple[int, str]]:
         """
