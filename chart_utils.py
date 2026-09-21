@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
+import kiwoom_api
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -23,6 +24,24 @@ import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_korean_font_fallback() -> bool:
+    """기본 글꼴(DejaVu Sans)에 없는 한글 글리프만 설치된 한글 폰트로 대체 (차트 디자인은 그대로).
+    한글 폰트가 하나도 없으면 False — 한글 제목 대신 종목코드를 쓰도록 호출부가 판단."""
+    try:
+        from matplotlib import font_manager as fm
+        available = {f.name for f in fm.fontManager.ttflist}
+        found = [n for n in ('Malgun Gothic', 'NanumGothic', 'Nanum Gothic', 'Noto Sans CJK KR',
+                             'Noto Sans KR', 'AppleGothic', 'UnDotum', 'Baekmuk Gothic') if n in available]
+        if found:
+            plt.rcParams['font.family'] = ['DejaVu Sans'] + found
+        return bool(found)
+    except Exception:
+        return False
+
+
+_HAS_KOREAN_FONT = _setup_korean_font_fallback()
 
 # ── Timeframe constants ────────────────────────────────────────────────
 
@@ -600,7 +619,6 @@ def normalize_stock_code(code) -> str:
 # ── Kiwoom REST API + KRX KIND 종목 검색 ──────────────────────────────
 
 _KIWOOM_API_BASE = 'https://api.kiwoom.com'
-_KIWOOM_TOKEN_CACHE: dict = {'token': None, 'expires_at': 0.0}
 _KRX_STOCK_CACHE: dict = {'items': [], 'by_code': {}, 'by_norm': {}, 'loaded_at': 0.0}
 _KR_SEARCH_CACHE: dict = {}
 _KR_SEARCH_TTL  = 600   # 검색 결과 캐시 10분
@@ -609,45 +627,16 @@ _KRX_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kr_s
 
 
 def get_kiwoom_access_token() -> 'str | None':
-    """POST oauth2/token (client_credentials). 24h token, 5-min buffer."""
-    cache = _KIWOOM_TOKEN_CACHE
-    now = _time.time()
-    if cache['token'] and now < cache['expires_at']:
-        return cache['token']
-
-    app_key = os.environ.get('KIWOOM_APP_KEY', '')
-    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
-    if not app_key or not secret:
-        print('[TOKEN REFRESH] KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 환경변수 미설정')
-        return None
-
-    print('[TOKEN REFRESH] 토큰 요청 중...')
+    """키 로딩(env → .env → 키 파일)과 토큰 캐시·재발급은 kiwoom_api 로 일원화."""
     try:
-        r = requests.post(
-            f'{_KIWOOM_API_BASE}/oauth2/token',
-            json={'grant_type': 'client_credentials', 'appkey': app_key, 'secretkey': secret},
-            timeout=10,
-        )
-        print(f'[TOKEN REFRESH] status={r.status_code}')
-        j = r.json()
-        token = j.get('access_token') or j.get('token') or j.get('accessToken')
-        if not token:
-            print(f'[TOKEN REFRESH] 토큰 필드 없음: {str(j)[:300]}')
-            return None
-        expires_in = int(j.get('expires_in', 86400))
-        cache['token'] = token
-        cache['expires_at'] = now + expires_in - 300
-        print(f'[TOKEN REFRESH] 토큰 갱신 성공 (expires_in={expires_in}s)')
-        return token
-    except Exception as e:
-        print(f'[TOKEN REFRESH] 오류: {e}')
+        return kiwoom_api.get_access_token()
+    except kiwoom_api.KiwoomError:
         return None
 
 
 def _kiwoom_headers() -> dict:
     token   = get_kiwoom_access_token()
-    app_key = os.environ.get('KIWOOM_APP_KEY', '')
-    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
+    app_key, secret = kiwoom_api.get_credentials()
     h = {'Content-Type': 'application/json'}
     if token:
         h['Authorization'] = f'Bearer {token}'
@@ -1581,6 +1570,107 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
     except Exception:
         logger.error("create_us_stock_chart 오류:\n%s", tb.format_exc())
         result['error'] = str(tb.format_exc().strip().split('\n')[-1])
+        plt.close('all')
+
+    return result
+
+
+# ── /au 국내주식: 키움증권 REST API ────────────────────────────────────
+
+# 키움 봉 종류: 1h/4h/12h 는 60분봉(정규장) 기반, 4h/12h 는 KST 경계로 집계
+_KIWOOM_KIND     = {'1d': 'day', '1w': 'week', '1y': 'month', '1h': 'hour', '4h': 'hour', '12h': 'hour'}
+_KIWOOM_MIN_ROWS = {'1d': 300, '1w': 60, '1y': 60, '1h': 60, '4h': 240, '12h': 240}
+
+_KIWOOM_MSG_NOT_FOUND = "국내주식 종목을 찾을 수 없습니다: {query}"
+_KIWOOM_MSG_AUTH      = "키움증권 API 인증에 실패했습니다. 서버 로그를 확인해주세요."
+_KIWOOM_MSG_DATA      = "키움증권에서 차트 데이터를 가져오지 못했습니다."
+
+
+def _fetch_kiwoom_kr_df(code: str, timeframe: str) -> pd.DataFrame:
+    df = kiwoom_api.fetch_ohlcv(code, _KIWOOM_KIND[timeframe], _KIWOOM_MIN_ROWS[timeframe])
+    if timeframe in ('4h', '12h'):
+        df = _resample_ohlcv(df, timeframe)
+    return df
+
+
+def create_kiwoom_kr_stock_chart(query: str, timeframe: str = '1d') -> dict:
+    """/au 국내주식: 종목명/6자리 코드 → 키움 종목 검색 → 키움 REST OHLCV → 기존 _draw_chart.
+    yfinance 는 호출하지 않는다."""
+    query = query.strip()
+    result = {
+        'success': False, 'file_path': None, 'current_price': None,
+        'symbol': query, 'timeframe': timeframe, 'exchange': 'KIWOOM',
+        'error': None, 'currency': '₩', 'caption': '',
+    }
+    logger.info("[AU] input=%s", query)
+
+    if timeframe not in VALID_INTERVALS:
+        result['error'] = (
+            f"지원하지 않는 인터벌: {timeframe}\n"
+            f"지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y"
+        )
+        return result
+
+    try:
+        stock = kiwoom_api.search_stock(query)
+        if stock is None:
+            logger.info("[AU] Korean stock not found: %s", query)
+            result['error'] = _KIWOOM_MSG_NOT_FOUND.format(query=query)
+            return result
+        code, name = stock['code'], stock['name']
+        result['symbol'] = code
+        logger.info("[AU] Korean stock found: %s (%s)", name, code)
+        logger.info("[AU] source=KIWOOM")
+
+        df_full = _fetch_kiwoom_kr_df(code, timeframe)
+        df = df_full.tail(60)
+
+        current_price = float(df['close'].iloc[-1])
+        prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
+        result['current_price'] = current_price
+
+        # 52주 최고/최저는 일봉 기준
+        high_52w = low_52w = None
+        try:
+            df_1d = df_full if timeframe == '1d' else _fetch_kiwoom_kr_df(code, '1d')
+            year  = df_1d.tail(252)
+            high_52w, low_52w = float(year['high'].max()), float(year['low'].min())
+        except kiwoom_api.KiwoomError as e:
+            logger.warning("[AU] 52주 일봉 조회 실패(생략): %s", e)
+
+        label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
+        title    = (f"{name} ({code}) - {label} - Kiwoom" if _HAS_KOREAN_FONT
+                    else f"{code} - {label} - Kiwoom")     # 한글 폰트 없는 서버에서 글자 깨짐 방지
+        tmp_path = _make_tmp_path()
+        _draw_chart(df, title, timeframe, tmp_path)
+
+        lines = [
+            f"📊 {name} ({code}) 차트",
+            f"🕒 Timeframe: {label}\n",
+            f"현재가: {_fmt_kr(current_price)}원",
+            f"전일대비: {_change_line(current_price, prev_price, _fmt_kr)}",
+        ]
+        if high_52w is not None:
+            lines.append(f"52주 최고가: {_fmt_kr(high_52w)}원")
+        if low_52w is not None:
+            lines.append(f"52주 최저가: {_fmt_kr(low_52w)}원")
+        if stock.get('market_name'):
+            lines.append(f"\n🏢 시장: {stock['market_name']}")
+
+        result['success']   = True
+        result['file_path'] = tmp_path
+        result['caption']   = '\n'.join(lines)
+        logger.info("[AU] chart generated successfully")
+
+    except kiwoom_api.KiwoomAuthError as e:
+        logger.error("[AU] Kiwoom auth error: %s", e)
+        result['error'] = _KIWOOM_MSG_AUTH
+    except kiwoom_api.KiwoomError as e:
+        logger.error("[AU] Kiwoom data error: %s", e)
+        result['error'] = _KIWOOM_MSG_DATA
+    except Exception:
+        logger.error("create_kiwoom_kr_stock_chart 오류:\n%s", tb.format_exc())
+        result['error'] = _KIWOOM_MSG_DATA
         plt.close('all')
 
     return result

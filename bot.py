@@ -56,12 +56,14 @@ import datetime as _dt
 import news_utils
 import calendar_utils
 import ipo_utils
+import kiwoom_api
 from database import Database
 from chart_utils import (
     create_clean_candlestick_chart,
     create_perps_chart,
     create_kr_stock_chart,
     create_us_stock_chart,
+    create_kiwoom_kr_stock_chart,
     find_kr_stock,
     normalize_symbol,
     format_price,
@@ -2067,21 +2069,47 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # /au 명령어 (미국 주식 차트)
 # ═══════════════════════════════════════════════════
 
+def _split_au_query(args: list) -> tuple:
+    """/au 인자 → (종목 검색어, 인터벌 또는 None). 마지막 인자가 유효한 인터벌이면 분리."""
+    if len(args) >= 2:
+        tf = parse_timeframe(args[-1])
+        if tf is not None:
+            return ' '.join(args[:-1]), tf
+    return ' '.join(args), None
+
+
 async def cmd_au(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /au 티커           → 미국 주식 일봉(1d) 차트
-    /au 티커 인터벌    → 지정 인터벌 차트 (1d, 1h)
-    예: /au AAPL  /  /au TSLA 1h
+    /au 종목            → 주식 일봉(1d) 차트
+    /au 종목 인터벌     → 지정 인터벌 차트 (1h/4h/12h/1d/1w/1y)
+    한글 종목명·6자리 종목코드 → 국내주식 (키움증권 REST API)
+    영문 티커                  → 해외주식 (기존 로직)
+    예: /au 삼성전자  /  /au 005930 1w  /  /au AAPL  /  /au TSLA 1h
     """
     if not update.message:
         return
 
     if not context.args:
         await update.message.reply_text(
-            "형식: /au 티커 [인터벌]\n"
+            "형식: /au 종목 [인터벌]\n"
             "예시: /au AAPL  /  /au TSLA 4h  /  /au NVDA 1w\n"
+            "국내: /au 삼성전자  /  /au 005930  /  /au SK하이닉스 1w\n"
             "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
         )
+        return
+
+    # ── 국내/해외 판별: 한글 종목명 또는 6자리 종목코드면 국내주식(키움 REST API) ──
+    kr_query, kr_tf = _split_au_query(list(context.args))
+    if kiwoom_api.is_korean_input(kr_query):
+        timeframe = kr_tf or '1d'
+        logger.info("[AU] route=KOREAN input=%s timeframe=%s", kr_query, timeframe)
+        processing_msg = await update.message.reply_text(f"차트 생성 중... {kr_query} ({timeframe})")
+        result = await asyncio.to_thread(create_kiwoom_kr_stock_chart, kr_query, timeframe)
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+        await _send_chart_result(update, result)
         return
 
     ticker = context.args[0].upper()
@@ -2099,7 +2127,16 @@ async def cmd_au(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     processing_msg = await update.message.reply_text(f"차트 생성 중... {ticker} ({timeframe})")
 
+    logger.info("[AU] route=OVERSEAS input=%s timeframe=%s", ticker, timeframe)
     result = await asyncio.to_thread(create_us_stock_chart, ticker, timeframe)
+
+    # 영문 이름만 있는 국내 종목(예: NAVER) 구제: 해외 조회 실패 시 키움 종목명이 정확히 같을 때만 국내로 재시도
+    if not result.get('success') and len(context.args) <= 2:
+        kr_hit = await asyncio.to_thread(kiwoom_api.find_exact_name, ticker)
+        if kr_hit:
+            logger.info("[AU] overseas lookup failed → Korean exact-name match: %s (%s)",
+                        kr_hit['name'], kr_hit['code'])
+            result = await asyncio.to_thread(create_kiwoom_kr_stock_chart, kr_hit['code'], timeframe)
 
     try:
         await processing_msg.delete()
@@ -2126,7 +2163,7 @@ _HELP_TEXT = (
     "/ac BTC → 코인 현물 차트\n"
     "/ap BTC → 코인 선물 차트\n"
     "/ak 삼성전자 → 한국 주식\n"
-    "/au AAPL → 미국 주식\n"
+    "/au AAPL → 미국 주식 / /au 삼성전자 → 국내 주식\n"
     "\n"
     "⏱ 인터벌:\n"
     "1h / 4h / 12h / 1d / 1w / 1y\n"
@@ -3131,6 +3168,7 @@ async def cmd_ipo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 def main() -> None:
+    kiwoom_api.log_credentials_status()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # CommandHandler 를 MessageHandler 보다 먼저 등록
