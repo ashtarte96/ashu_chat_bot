@@ -1849,7 +1849,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════
 
 async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/ac 티커 [인터벌] → 코인 현물 캔들 차트 (Binance→Bybit) + Upbit/Bithumb 가격"""
+    """/ac 티커 [인터벌] → 코인 현물 캔들 차트 (Binance→Bybit→MEXC) + Upbit/Bithumb 가격"""
     if not update.message:
         return
 
@@ -1946,7 +1946,7 @@ async def _send_chart_result(
 # ═══════════════════════════════════════════════════
 
 async def cmd_ap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/ap 티커 [인터벌] → 코인 선물(PERPS) 캔들 차트 (Binance→Bybit)"""
+    """/ap 티커 [인터벌] → 코인 선물(PERPS) 캔들 차트 (Binance→Bybit→MEXC)"""
     if not update.message:
         return
 
