@@ -413,6 +413,30 @@ _KRX_CACHE_TTL  = 600   # 종목 리스트 캐시 10분
 _KRX_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kr_stock_cache.json')
 
 
+_KIWOOM_KEY_DIR = os.path.dirname(os.path.abspath(__file__))
+_KIWOOM_APPKEY_FILE = '51969534_appkey.txt'
+_KIWOOM_SECRETKEY_FILE = '51969534_secretkey.txt'
+
+
+def _read_credential(filename: str, env_name: str) -> str:
+    """키 파일 우선, 없으면 환경변수 (Render 등 파일 없는 배포 환경용)."""
+    try:
+        with open(os.path.join(_KIWOOM_KEY_DIR, filename), encoding='utf-8-sig') as f:
+            value = f.read().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    return os.environ.get(env_name, '').strip()
+
+
+def _kiwoom_credentials() -> 'tuple[str, str]':
+    return (
+        _read_credential(_KIWOOM_APPKEY_FILE, 'KIWOOM_APP_KEY'),
+        _read_credential(_KIWOOM_SECRETKEY_FILE, 'KIWOOM_SECRET_KEY'),
+    )
+
+
 def get_kiwoom_access_token() -> 'str | None':
     """POST oauth2/token (client_credentials). 24h token, 5-min buffer."""
     cache = _KIWOOM_TOKEN_CACHE
@@ -420,10 +444,9 @@ def get_kiwoom_access_token() -> 'str | None':
     if cache['token'] and now < cache['expires_at']:
         return cache['token']
 
-    app_key = os.environ.get('KIWOOM_APP_KEY', '')
-    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
+    app_key, secret = _kiwoom_credentials()
     if not app_key or not secret:
-        print('[TOKEN REFRESH] KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 환경변수 미설정')
+        print(f'[TOKEN REFRESH] 키 미설정: {_KIWOOM_APPKEY_FILE} / {_KIWOOM_SECRETKEY_FILE} 또는 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 환경변수 필요')
         return None
 
     print('[TOKEN REFRESH] 토큰 요청 중...')
@@ -451,8 +474,7 @@ def get_kiwoom_access_token() -> 'str | None':
 
 def _kiwoom_headers() -> dict:
     token   = get_kiwoom_access_token()
-    app_key = os.environ.get('KIWOOM_APP_KEY', '')
-    secret  = os.environ.get('KIWOOM_SECRET_KEY', '')
+    app_key, secret = _kiwoom_credentials()
     h = {'Content-Type': 'application/json'}
     if token:
         h['Authorization'] = f'Bearer {token}'

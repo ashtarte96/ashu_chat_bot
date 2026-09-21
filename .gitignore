@@ -3,6 +3,8 @@
 .env.*
 config.py
 secrets.py
+*_appkey.txt
+*_secretkey.txt
 
 # 데이터베이스
 *.db
