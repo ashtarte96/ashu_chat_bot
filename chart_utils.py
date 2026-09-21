@@ -325,6 +325,201 @@ def fetch_bybit_perps(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataF
         return None
 
 
+# ── MEXC public REST API (마지막 fallback 거래소, API 키 불필요) ────────
+
+_MEXC_SPOT_BASE    = 'https://api.mexc.com'
+_MEXC_FUTURES_BASE = 'https://contract.mexc.com'
+_MEXC_TIMEOUT      = 10
+_MEXC_SPOT_MAX_LIMIT = 500   # 현물 klines 1회 최대 개수
+
+# MEXC 지원 봉만 매핑. 12h 는 MEXC 에 없어서 4h 를 UTC 12h 경계로 집계한다
+# (1y 는 기존 거래소와 동일하게 일봉을 받아 월봉으로 리샘플).
+_MEXC_SPOT_INTERVAL = {
+    '1h': '60m', '4h': '4h', '12h': '4h',
+    '1d': '1d', '1w': '1W', '1y': '1d',
+}
+_MEXC_FUTURES_INTERVAL = {
+    '1h': 'Min60', '4h': 'Hour4', '12h': 'Hour4',
+    '1d': 'Day1', '1w': 'Week1', '1y': 'Day1',
+}
+_MEXC_INTERVAL_SEC = {
+    '1h': 3600, '4h': 14400, '12h': 14400,
+    '1d': 86400, '1w': 604800, '1y': 86400,
+}
+
+
+def _mexc_get(url: str, params: dict, tag: str) -> 'dict | list | None':
+    """MEXC public GET 1회 (재시도 없음). HTTP/네트워크/JSON 오류는 None."""
+    try:
+        r = requests.get(url, params=params, timeout=_MEXC_TIMEOUT)
+        if r.status_code == 429:
+            print(f"[{tag} FAIL] rate limited (HTTP 429)")
+            return None
+        if r.status_code != 200:
+            print(f"[{tag} FAIL] HTTP {r.status_code}: {r.text[:200]}")
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"[{tag} FAIL] {type(e).__name__}: {e}")
+        logger.warning("[%s FAIL] %s", tag, e)
+        return None
+
+
+def _mexc_finish_df(df: pd.DataFrame, timeframe: str) -> 'pd.DataFrame | None':
+    """공통 후처리: 숫자 변환 → 12h 집계. 기존 fetch_* 와 동일한 형식 반환."""
+    df.index.name = 'timestamp'
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df[['open', 'high', 'low', 'close', 'volume']].dropna()
+    if timeframe == '12h':
+        df = _resample_ohlcv(df, '12h')
+    return df if not df.empty else None
+
+
+def mexc_spot_exists(symbol: str) -> bool:
+    """MEXC 현물에서 거래 가능한 페어인지 확인. 없는 심볼은 exchangeInfo 가 빈 목록을 준다."""
+    data = _mexc_get(f"{_MEXC_SPOT_BASE}/api/v3/exchangeInfo", {"symbol": symbol}, "MEXC SPOT")
+    symbols = data.get('symbols') if isinstance(data, dict) else None
+    if not symbols:
+        return False
+    info = symbols[0]
+    return str(info.get('status')) == '1' and bool(info.get('isSpotTradingAllowed'))
+
+
+def fetch_mexc_spot(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """MEXC spot kline. 종목 존재 확인 후에만 캔들 요청. Returns ascending DataFrame or None."""
+    interval = _MEXC_SPOT_INTERVAL.get(timeframe)
+    if interval is None:
+        print(f"[MEXC SPOT FAIL] 지원하지 않는 인터벌: {timeframe}")
+        return None
+    try:
+        if not mexc_spot_exists(symbol):
+            print(f"[MEXC SPOT] {symbol} 종목 없음")
+            return None
+        if timeframe == '12h':
+            limit = limit * 3
+        limit = min(limit, _MEXC_SPOT_MAX_LIMIT)
+        rows = _mexc_get(f"{_MEXC_SPOT_BASE}/api/v3/klines",
+                         {"symbol": symbol, "interval": interval, "limit": limit}, "MEXC SPOT")
+        if not rows or not isinstance(rows, list):
+            print(f"[MEXC SPOT FAIL] {symbol} empty/invalid klines")
+            return None
+        df = pd.DataFrame(
+            [[r[0], r[1], r[2], r[3], r[4], r[5]] for r in rows],
+            columns=['ts', 'open', 'high', 'low', 'close', 'volume'],
+        )
+        df.index = pd.to_datetime(df['ts'].astype(int), unit='ms', utc=True)
+        df = _mexc_finish_df(df, timeframe)
+        if df is not None:
+            print(f"[MEXC SPOT OK] {symbol} {timeframe} rows={len(df)}")
+        return df
+    except Exception:
+        print(f"[MEXC SPOT FAIL] {symbol} {timeframe}")
+        tb.print_exc()
+        logger.exception("[MEXC SPOT FAIL] %s %s", symbol, timeframe)
+        return None
+
+
+def _mexc_contract_symbol(symbol: str) -> str:
+    """'ABCUSDT' → 'ABC_USDT'"""
+    return f"{symbol[:-4]}_USDT" if symbol.endswith('USDT') else symbol
+
+
+def _mexc_futures_detail(symbol: str) -> 'dict | None':
+    """MEXC USDT 무기한 계약 정보. 없거나 거래 불가(state != 0)면 None."""
+    data = _mexc_get(f"{_MEXC_FUTURES_BASE}/api/v1/contract/detail",
+                     {"symbol": _mexc_contract_symbol(symbol)}, "MEXC FUTURES")
+    if not isinstance(data, dict) or not data.get('success'):
+        return None
+    detail = data.get('data')
+    if not isinstance(detail, dict) or detail.get('state') != 0:
+        return None
+    return detail
+
+
+def fetch_mexc_perps(symbol: str, timeframe: str, limit: int = 60) -> 'pd.DataFrame | None':
+    """MEXC USDT futures kline. 계약 존재 확인 후에만 캔들 요청. volume 은 코인 수량으로 환산."""
+    interval = _MEXC_FUTURES_INTERVAL.get(timeframe)
+    if interval is None:
+        print(f"[MEXC FUTURES FAIL] 지원하지 않는 인터벌: {timeframe}")
+        return None
+    try:
+        detail = _mexc_futures_detail(symbol)
+        if detail is None:
+            print(f"[MEXC FUTURES] {symbol} 계약 없음")
+            return None
+        if timeframe == '12h':
+            limit = limit * 3
+        end = int(_time.time())
+        start = end - (limit + 2) * _MEXC_INTERVAL_SEC[timeframe]
+        data = _mexc_get(
+            f"{_MEXC_FUTURES_BASE}/api/v1/contract/kline/{_mexc_contract_symbol(symbol)}",
+            {"interval": interval, "start": start, "end": end}, "MEXC FUTURES")
+        k = data.get('data') if isinstance(data, dict) and data.get('success') else None
+        if not isinstance(k, dict) or not k.get('time'):
+            print(f"[MEXC FUTURES FAIL] {symbol} empty/invalid klines")
+            return None
+        try:
+            contract_size = float(detail.get('contractSize') or 1)
+        except (TypeError, ValueError):
+            contract_size = 1.0
+        df = pd.DataFrame({
+            'open': k['open'], 'high': k['high'], 'low': k['low'],
+            'close': k['close'], 'volume': k['vol'],
+        })
+        df.index = pd.to_datetime(pd.Series(k['time']).astype(int), unit='s', utc=True)
+        df = _mexc_finish_df(df, timeframe)
+        if df is not None:
+            df['volume'] = df['volume'] * contract_size
+            print(f"[MEXC FUTURES OK] {symbol} {timeframe} rows={len(df)}")
+        return df
+    except Exception:
+        print(f"[MEXC FUTURES FAIL] {symbol} {timeframe}")
+        tb.print_exc()
+        logger.exception("[MEXC FUTURES FAIL] %s %s", symbol, timeframe)
+        return None
+
+
+def get_mexc_funding_rate(symbol: str) -> 'float | None':
+    """MEXC USDT futures 최근 펀딩비. 실패 시 None."""
+    data = _mexc_get(
+        f"{_MEXC_FUTURES_BASE}/api/v1/contract/funding_rate/{_mexc_contract_symbol(symbol)}",
+        {}, "MEXC FUNDING")
+    try:
+        return float(data['data']['fundingRate'])
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
+# ── 코인 거래소 탐색 (ac/ap 공통): Binance → Bybit → MEXC ───────────────
+
+_SPOT_SOURCES = (
+    ('Binance spot', fetch_binance_spot),
+    ('Bybit spot',   fetch_bybit_spot),
+    ('MEXC spot',    fetch_mexc_spot),
+)
+_PERPS_SOURCES = (
+    ('Binance futures', fetch_binance_futures),
+    ('Bybit perps',     fetch_bybit_perps),
+    ('MEXC futures',    fetch_mexc_perps),
+)
+
+
+def _fetch_first_available(sources, tag: str, sym: str, timeframe: str,
+                           limit: int) -> 'tuple[pd.DataFrame | None, str | None]':
+    """우선순위대로 조회해 처음 성공한 (df, 거래소명) 반환. 한 곳이 실패해도 다음으로 진행."""
+    for name, fetch in sources:
+        try:
+            df = fetch(sym, timeframe, limit)
+        except Exception as e:
+            print(f"[{tag}] {name} 예외: {e}")
+            df = None
+        if df is not None:
+            return df, name
+        print(f"[{tag}] {name} None → next")
+    return None, None
+
+
 # ── US stocks (yfinance) ───────────────────────────────────────────────
 
 def _normalize_yf_df(data) -> 'pd.DataFrame | None':
@@ -1161,7 +1356,7 @@ def fetch_bithumb_ticker(symbol: str) -> 'float | None':
 # ── Public chart functions ─────────────────────────────────────────────
 
 def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """/ac: Binance spot → Bybit spot fallback"""
+    """/ac: Binance spot → Bybit spot → MEXC spot fallback"""
     sym = _parse_symbol(symbol)
     result = {
         'success': False, 'file_path': None, 'current_price': None,
@@ -1172,18 +1367,13 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
         limit = _FETCH_LIMIT.get(timeframe, 60)
         print(f"[AC] sym={sym} timeframe={timeframe} limit={limit}")
 
-        df = fetch_binance_spot(sym, timeframe, limit)
-        source = 'Binance spot'
-        if df is None:
-            print(f"[AC] Binance spot None → try Bybit spot")
-            df     = fetch_bybit_spot(sym, timeframe, limit)
-            source = 'Bybit spot'
+        df, source = _fetch_first_available(_SPOT_SOURCES, 'AC', sym, timeframe, limit)
 
         if df is None:
-            print(f"[AC] Both sources returned None for {sym} {timeframe}")
+            print(f"[AC] All sources returned None for {sym} {timeframe}")
             result['error'] = (
                 f"코인 데이터를 가져올 수 없습니다: {sym}\n"
-                "Binance / Bybit 모두 실패 — 서버 로그를 확인하세요."
+                "Binance / Bybit / MEXC 모두 실패 — 서버 로그를 확인하세요."
             )
             return result
 
@@ -1216,9 +1406,7 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
             high_52w = float(df_raw['high'].max())
             low_52w  = float(df_raw['low'].min())
         else:
-            df_1d = fetch_binance_spot(sym, '1d', 365)
-            if df_1d is None:
-                df_1d = fetch_bybit_spot(sym, '1d', 365)
+            df_1d, _ = _fetch_first_available(_SPOT_SOURCES, 'AC', sym, '1d', 365)
             high_52w = float(df_1d['high'].max()) if df_1d is not None else None
             low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
@@ -1254,7 +1442,7 @@ def create_clean_candlestick_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
-    """/ap: Binance futures → Bybit perps fallback"""
+    """/ap: Binance futures → Bybit perps → MEXC futures fallback"""
     sym = _parse_symbol(symbol)
     result = {
         'success': False, 'file_path': None, 'current_price': None,
@@ -1264,16 +1452,12 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
     try:
         limit = _FETCH_LIMIT.get(timeframe, 60)
 
-        df = fetch_binance_futures(sym, timeframe, limit)
-        source = 'Binance futures'
-        if df is None:
-            df     = fetch_bybit_perps(sym, timeframe, limit)
-            source = 'Bybit perps'
+        df, source = _fetch_first_available(_PERPS_SOURCES, 'AP', sym, timeframe, limit)
 
         if df is None:
             result['error'] = (
                 f"선물 데이터를 가져올 수 없습니다: {sym}\n"
-                "Binance futures / Bybit perps 모두 실패 — 서버 로그를 확인하세요."
+                "Binance futures / Bybit perps / MEXC futures 모두 실패 — 서버 로그를 확인하세요."
             )
             return result
 
@@ -1299,13 +1483,11 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
             high_52w = float(df_raw['high'].max())
             low_52w  = float(df_raw['low'].min())
         else:
-            df_1d = fetch_binance_futures(sym, '1d', 365)
-            if df_1d is None:
-                df_1d = fetch_bybit_perps(sym, '1d', 365)
+            df_1d, _ = _fetch_first_available(_PERPS_SOURCES, 'AP', sym, '1d', 365)
             high_52w = float(df_1d['high'].max()) if df_1d is not None else None
             low_52w  = float(df_1d['low'].min())  if df_1d is not None else None
 
-        funding = get_funding_rate(sym)
+        funding = get_mexc_funding_rate(sym) if source == 'MEXC futures' else get_funding_rate(sym)
 
         label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
         title    = f"{sym} PERPS - {label} - {source}"
