@@ -374,6 +374,137 @@ def _fetch_us_yf(ticker: str, timeframe: str) -> pd.DataFrame:
         raise ValueError(f"yfinance 조회 실패: {ticker}") from e
 
 
+# ── US stocks (Kiwoom REST API) ────────────────────────────────────────
+
+_KIWOOM_US_EXCHANGES = ('ND', 'NY', 'NA')   # NASDAQ, NYSE, AMEX
+_KIWOOM_US_EXCHANGE_CACHE: dict = {}
+_KIWOOM_US_MAX_PAGES = 20
+_KIWOOM_US_PAGE_DELAY = 0.2
+_US_TZ = 'America/New_York'
+
+# 일/주/월 차트 API-ID (모두 /api/us/chart, 응답 최신순 100건/페이지)
+_KIWOOM_US_CHART_API = {'1d': 'usa06012', '1w': 'usa06013', '1y': 'usa06014'}
+_KIWOOM_US_MINUTE_API = 'usa06011'
+# 분봉(60분) 정규장 행 수 — 4h/12h 는 60분봉을 리샘플하므로 더 많이 필요
+_KIWOOM_US_HOURLY_ROWS = {'1h': 60, '4h': 180, '12h': 220}
+
+
+def _kiwoom_us_request(api_id: str, path: str, body: dict,
+                       cont_yn: str = '', next_key: str = '') -> 'tuple[dict, str, str]':
+    """키움 미국주식 API 1회 호출 → (body, cont-yn, next-key). 오류 시 ValueError."""
+    token = get_kiwoom_access_token()
+    if not token:
+        raise ValueError('키움 access token 발급 실패')
+    headers = {
+        'Content-Type': 'application/json;charset=UTF-8',
+        'api-id': api_id,
+        'authorization': f'Bearer {token}',
+    }
+    if cont_yn:
+        headers['cont-yn'] = cont_yn
+        headers['next-key'] = next_key
+    r = requests.post(f'{_KIWOOM_API_BASE}{path}', headers=headers, json=body, timeout=15)
+    if r.status_code != 200:
+        raise ValueError(f'키움 {api_id} HTTP {r.status_code}: {r.text[:200]}')
+    data = r.json()
+    if data.get('return_code') not in (None, 0):
+        raise ValueError(f"키움 {api_id} 오류: {data.get('return_msg')}")
+    return data, r.headers.get('cont-yn', 'N'), r.headers.get('next-key', '')
+
+
+def _kiwoom_us_quote(ticker: str) -> 'tuple[str, dict]':
+    """usa20100 현재가 종목정보 → (거래소구분, 응답). 거래소는 ND→NY→NA 순으로 탐색."""
+    cached = _KIWOOM_US_EXCHANGE_CACHE.get(ticker)
+    last_err: 'Exception | None' = None
+    for ex in ((cached,) if cached else _KIWOOM_US_EXCHANGES):
+        try:
+            data, _, _ = _kiwoom_us_request(
+                'usa20100', '/api/us/mrkcond', {'stex_tp': ex, 'stk_cd': ticker})
+        except ValueError as e:
+            last_err = e
+            continue
+        _KIWOOM_US_EXCHANGE_CACHE[ticker] = ex
+        return ex, data
+    raise ValueError(f'키움 미국주식 종목 조회 실패: {ticker} ({last_err})')
+
+
+def _kiwoom_us_fetch_rows(api_id: str, body: dict, min_rows: int, keep=None) -> list:
+    """연속조회(cont-yn/next-key)로 min_rows 이상 모일 때까지 최신순 행을 수집."""
+    rows: list = []
+    cont_yn = next_key = ''
+    for _ in range(_KIWOOM_US_MAX_PAGES):
+        data, cont_yn, next_key = _kiwoom_us_request(api_id, '/api/us/chart', body, cont_yn, next_key)
+        page = data.get('result_list') or []
+        rows.extend(r for r in page if keep is None or keep(r))
+        if cont_yn != 'Y' or not page or len(rows) >= min_rows:
+            break
+        _time.sleep(_KIWOOM_US_PAGE_DELAY)
+    return rows
+
+
+def _kiwoom_us_rows_to_df(rows: list, ts_of) -> pd.DataFrame:
+    recs = []
+    for r in rows:
+        try:
+            recs.append((
+                ts_of(r),
+                float(r['open_pric']), float(r['high_pric']),
+                float(r['low_pric']), float(r['cur_prc']),
+                float(r.get('acc_trde_qty') or r.get('trde_qty') or 0),
+            ))
+        except (KeyError, ValueError, TypeError):
+            continue
+    df = pd.DataFrame(recs, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+    df = df[df['close'] > 0].drop_duplicates('ts').set_index('ts').sort_index()
+    if df.empty:
+        raise ValueError('키움 미국주식 차트 데이터 없음')
+    return df
+
+
+def _fetch_us_kiwoom(ticker: str, timeframe: str) -> 'tuple[pd.DataFrame, dict]':
+    """키움 REST API 미국주식 차트 → (마지막 60행 OHLCV, 현재가 종목정보). 실패 시 ValueError."""
+    exchange, quote = _kiwoom_us_quote(ticker)
+    today = pd.Timestamp.now(tz=_US_TZ).strftime('%Y%m%d')
+    body = {'stex_tp': exchange, 'stk_cd': ticker, 'strt_dt': today,
+            'upd_stkpc_tp': '1', 'exrt_appl_tp': '0'}
+    print(f'[AU KIWOOM] {ticker} {timeframe} exchange={exchange}')
+
+    if timeframe in _KIWOOM_US_CHART_API:
+        rows = _kiwoom_us_fetch_rows(_KIWOOM_US_CHART_API[timeframe], body, 60)
+        df = _kiwoom_us_rows_to_df(
+            rows, lambda r: pd.Timestamp(r['dt']).tz_localize(_US_TZ))
+    elif timeframe in _KIWOOM_US_HOURLY_ROWS:
+        def regular_session(r) -> bool:
+            tm = r.get('cntr_tm') or ''
+            return len(tm) >= 12 and '09' <= tm[8:10] <= '16' and tm[10:12] == '00'
+
+        rows = _kiwoom_us_fetch_rows(
+            _KIWOOM_US_MINUTE_API, {**body, 'tic_scope': '60'},
+            _KIWOOM_US_HOURLY_ROWS[timeframe], keep=regular_session)
+        df = _kiwoom_us_rows_to_df(
+            rows, lambda r: pd.Timestamp(
+                pd.to_datetime(r['cntr_tm'], format='%Y%m%d%H%M%S')).tz_localize(_US_TZ))
+        if timeframe in ('4h', '12h'):
+            df = _resample_ohlcv(df, timeframe)
+    else:
+        raise ValueError(f'키움 미지원 인터벌: {timeframe}')
+
+    df = df.tail(60)
+    print(f'[AU KIWOOM OK] {ticker} {timeframe} rows={len(df)}')
+    return df, quote
+
+
+def _kiwoom_us_52w(quote: dict) -> 'tuple[float | None, float | None]':
+    def _num(key: str) -> 'float | None':
+        try:
+            # 키움은 부호를 전일대비 방향 표시로 붙여 줌 (예: '-164.2700') → 절대값 사용
+            v = abs(float(str(quote.get(key, '')).replace(',', '')))
+            return v if v > 0 else None
+        except ValueError:
+            return None
+    return _num('52wk_hgst_pric'), _num('52wk_lwst_pric')
+
+
 # ── Korean stocks (Kiwoom REST API + KRX KIND) ────────────────────────
 
 # Market → suffix  (bare 6-digit code + suffix for logging)
@@ -1363,11 +1494,11 @@ def create_perps_chart(symbol: str, timeframe: str = '1d') -> dict:
 
 
 def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
-    """/au: yfinance, all timeframes"""
+    """/au: 키움 REST API (실패 시 yfinance 폴백), all timeframes"""
     ticker = ticker.upper().strip()
     result = {
         'success': False, 'file_path': None, 'current_price': None,
-        'symbol': ticker, 'timeframe': timeframe, 'exchange': 'yfinance',
+        'symbol': ticker, 'timeframe': timeframe, 'exchange': 'kiwoom',
         'error': None, 'currency': '$', 'caption': '',
     }
 
@@ -1379,15 +1510,25 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
         return result
 
     try:
-        df = _fetch_us_yf(ticker, timeframe)
+        source = 'kiwoom'
+        quote = None
+        try:
+            df, quote = _fetch_us_kiwoom(ticker, timeframe)
+        except Exception as e:
+            print(f"[AU KIWOOM FAIL] {ticker} {timeframe}: {e} → yfinance fallback")
+            logger.warning("[AU KIWOOM FAIL] %s %s: %s", ticker, timeframe, e)
+            source = 'yfinance'
+            df = _fetch_us_yf(ticker, timeframe)
+        result['exchange'] = source
 
         current_price = float(df['close'].iloc[-1])
         prev_price    = float(df['close'].iloc[-2]) if len(df) >= 2 else current_price
         result['current_price'] = current_price
 
-        # 52w stats from 1d data
         high_52w = low_52w = None
-        if timeframe == '1d':
+        if quote is not None:
+            high_52w, low_52w = _kiwoom_us_52w(quote)
+        elif timeframe == '1d':
             high_52w = float(df['high'].max())
             low_52w  = float(df['low'].min())
         else:
@@ -1399,7 +1540,7 @@ def create_us_stock_chart(ticker: str, timeframe: str = '1d') -> dict:
                 pass
 
         label    = _TIMEFRAME_LABEL.get(timeframe, timeframe.upper())
-        title    = f"{ticker} - {label} - yfinance"
+        title    = f"{ticker} - {label} - {source}"
         tmp_path = _make_tmp_path()
         _draw_chart(df, title, timeframe, tmp_path)
 
