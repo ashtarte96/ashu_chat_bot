@@ -37,3 +37,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code worktrees / API key files (never commit)
+.claude/worktrees/
+*_appkey.txt
+*_secretkey.txt
