@@ -55,6 +55,7 @@ import datetime as _dt
 
 import news_utils
 import calendar_utils
+import ipo_utils
 from database import Database
 from chart_utils import (
     create_clean_candlestick_chart,
@@ -2983,6 +2984,149 @@ async def cmd_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ═══════════════════════════════════════════════════
+# 공모주 캘린더 (아이피오스탁) — 월~금 10:00 KST 자동 발송
+# ═══════════════════════════════════════════════════
+
+IPO_SEND_HOUR     = 10
+IPO_SEND_TIME     = _dt.time(IPO_SEND_HOUR, 0, 0, tzinfo=KST)
+IPO_SEND_DAYS     = (1, 2, 3, 4, 5)        # PTB run_daily: 0=일 … 6=토 → 월~금
+IPO_CATCHUP_UNTIL = _dt.time(12, 0)        # 이 시각 전에 재시작하면 놓친 발송을 보충
+IPO_MAX_RETRIES   = 2                      # 조회/발송 실패 시 재시도 횟수
+IPO_RETRY_SECONDS = 600                    # 재시도 간격 (10분)
+IPO_MANUAL_COOLDOWN = 30                   # /ipo 연속 호출 제한(초) — 사이트 과다 요청 방지
+
+_IPO_LOCK: 'asyncio.Lock | None' = None
+_ipo_last_manual = -float(IPO_MANUAL_COOLDOWN)
+
+
+def _get_ipo_lock() -> asyncio.Lock:
+    global _IPO_LOCK
+    if _IPO_LOCK is None:
+        _IPO_LOCK = asyncio.Lock()
+    return _IPO_LOCK
+
+
+def _ipo_schedule_retry(context: ContextTypes.DEFAULT_TYPE, data: dict, attempt: int) -> None:
+    if attempt >= IPO_MAX_RETRIES:
+        logger.error("[IPO] 재시도 한도(%d회) 초과 — 오늘 공모주 캘린더는 발송되지 않음", IPO_MAX_RETRIES)
+        return
+    context.job_queue.run_once(
+        ipo_calendar_job, when=IPO_RETRY_SECONDS,
+        data={**data, 'attempt': attempt + 1}, name=f'ipo_retry_{attempt + 1}',
+    )
+    logger.info("[IPO] %d분 뒤 재시도 예약 (%d/%d)",
+                IPO_RETRY_SECONDS // 60, attempt + 1, IPO_MAX_RETRIES)
+
+
+async def ipo_calendar_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """월~금 10:00 KST 자동 발송. 청약 있음 → 종목 정보, 조회 성공 + 청약 없음 → '없슈'.
+    사이트 접속/파싱 실패 시에는 절대 '없슈'를 보내지 않고 에러 로그 + 재시도만 한다."""
+    data    = context.job.data or {}
+    chat_id = data.get('chat_id')
+    attempt = int(data.get('attempt', 0))
+    now     = datetime.now(KST)
+    today   = now.date()
+    logger.info("[IPO] 자동 발송 시작 %s KST (attempt=%d/%d)",
+                now.strftime('%Y-%m-%d %H:%M:%S'), attempt, IPO_MAX_RETRIES)
+
+    if today.weekday() >= 5:
+        logger.info("[IPO] SKIP 주말 (%s)", today.isoformat())
+        return
+
+    async with _get_ipo_lock():
+        if ipo_utils.already_sent(today):
+            logger.info("[IPO] SKIP 중복 발송 방지 — %s 은(는) 이미 발송됨", today.isoformat())
+            return
+
+        try:
+            text, names = await asyncio.to_thread(ipo_utils.build_today_message, today)
+        except ipo_utils.IpoError as e:
+            logger.error("[IPO] 발송 안 함 — 아이피오스탁 조회/파싱 실패 ('없슈' 아님): %s", e)
+            _ipo_schedule_retry(context, data, attempt)
+            return
+        except Exception:
+            logger.exception("[IPO] 발송 안 함 — 예상치 못한 오류")
+            _ipo_schedule_retry(context, data, attempt)
+            return
+
+        try:
+            for chunk in _split_message(text):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+        except Exception as e:
+            logger.error("[IPO] Telegram 발송 실패 chat_id=%s: %s", chat_id, e)
+            _ipo_schedule_retry(context, data, attempt)
+            return
+
+        ipo_utils.mark_sent(today, names)
+        logger.info("[IPO] Telegram 발송 성공 chat_id=%s 종목수=%d 종목=%s",
+                    chat_id, len(names), names if names else '(없슈)')
+
+
+async def ipo_catchup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """봇 시작 직후 1회: 평일 10:00~12:00 사이에 재시작됐고 오늘 발송 기록이 없으면 보충 발송."""
+    now = datetime.now(KST)
+    if now.weekday() >= 5 or not (IPO_SEND_HOUR <= now.hour and now.time() < IPO_CATCHUP_UNTIL):
+        logger.info("[IPO] 시작 보충 확인: 대상 시간대 아님 (%s KST)", now.strftime('%Y-%m-%d %H:%M'))
+        return
+    logger.info("[IPO] 시작 보충 확인: 발송 시각 이후 시작 감지 → 오늘 발송 여부 확인")
+    await ipo_calendar_job(context)
+
+
+async def cmd_ipo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ipo [YYYY-MM-DD] → 공모주 캘린더 테스트 조회 (관리자 전용).
+    자동 발송과 동일한 메시지를 본인에게만 보여주며, 일일 발송 기록에는 영향이 없다."""
+    global _ipo_last_manual
+    if not update.message:
+        return
+    if not await check_is_admin(update, context):
+        await update.message.reply_text("권한이 없습니다.")
+        return
+
+    target = datetime.now(KST).date()
+    if context.args:
+        try:
+            target = datetime.strptime(context.args[0], '%Y-%m-%d').date()
+        except ValueError:
+            await update.message.reply_text("형식: /ipo  또는  /ipo YYYY-MM-DD")
+            return
+
+    wait = IPO_MANUAL_COOLDOWN - (time.monotonic() - _ipo_last_manual)
+    if wait > 0:
+        await update.message.reply_text(f"잠시 후 다시 시도해주세요. ({int(wait) + 1}초)")
+        return
+    _ipo_last_manual = time.monotonic()
+
+    logger.info("[IPO] /ipo 수동 조회 user=%s 기준일=%s",
+                update.effective_user.id if update.effective_user else None, target.isoformat())
+    processing_msg = await update.message.reply_text("🐰 공모주 조회 중...")
+    error = ''
+    try:
+        text, names = await asyncio.to_thread(ipo_utils.build_today_message, target)
+    except Exception as e:
+        logger.error("[IPO] /ipo 조회 실패: %s", e)
+        text, names = None, []
+        error = str(e)
+
+    try:
+        await processing_msg.delete()
+    except Exception:
+        pass
+
+    if text is None:
+        await update.message.reply_text(f"❌ 공모주 조회 실패 (조회 실패 시 자동 발송도 '없슈'를 보내지 않습니다)\n{error}")
+        return
+
+    for chunk in _split_message(text):
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+    logger.info("[IPO] /ipo 결과 전송 완료 종목수=%d 종목=%s", len(names), names)
+
+
+# ═══════════════════════════════════════════════════
 # 봇 시작
 # ═══════════════════════════════════════════════════
 
@@ -3018,6 +3162,7 @@ def main() -> None:
     app.add_handler(CommandHandler('news',      cmd_news))
     app.add_handler(CommandHandler('GC',        cmd_calendar))
     app.add_handler(CommandHandler('sendtest',  cmd_sendtest))
+    app.add_handler(CommandHandler('ipo',       cmd_ipo))
 
     # 자동 발송 스케줄러 (ANNOUNCE_CHAT_ID 환경변수 필요)
     if ANNOUNCE_CHAT_ID and app.job_queue:
@@ -3028,12 +3173,15 @@ def main() -> None:
             print(f"[ANNOUNCE CHAT]\nid={ANNOUNCE_CHAT_ID}")
             print(f"[SCHEDULER STARTED]\ntimezone=Asia/Seoul")
 
-            def _register(name, callback, t, data):
+            def _register(name, callback, t, data, days=None):
                 """기존 동명 job 제거 후 재등록 (재시작 중복 방지)."""
                 for j in jq.get_jobs_by_name(name):
                     j.schedule_removal()
-                jq.run_daily(callback, time=t, data=data, name=name)
-                print(f"[JOB REGISTERED] {name} {t.strftime('%H:%M')}")
+                if days:
+                    jq.run_daily(callback, time=t, days=days, data=data, name=name)
+                else:
+                    jq.run_daily(callback, time=t, data=data, name=name)
+                print(f"[JOB REGISTERED] {name} {t.strftime('%H:%M')}" + (f" days={days}" if days else ""))
 
             # ── 경제 캘린더 ──────────────────────────────
             _register(
@@ -3065,6 +3213,16 @@ def main() -> None:
                 _dt.time(17, 0, 0, tzinfo=KST),
                 {'chat_id': chat_id_int, 'period': 'evening'},
             )
+
+            # ── 공모주 캘린더 (월~금 10:00 KST) ────────────
+            if os.getenv('IPO_CALENDAR_ENABLED', '1').strip().lower() in ('0', 'false', 'off', 'no'):
+                print("[JOB SKIPPED] ipo_calendar (IPO_CALENDAR_ENABLED=off)")
+            else:
+                _register(
+                    'ipo_calendar', ipo_calendar_job, IPO_SEND_TIME,
+                    {'chat_id': chat_id_int}, days=IPO_SEND_DAYS,
+                )
+                jq.run_once(ipo_catchup_job, when=20, data={'chat_id': chat_id_int}, name='ipo_catchup')
 
         except ValueError:
             logger.warning("[SCHEDULER] ANNOUNCE_CHAT_ID is not a valid integer: %s", ANNOUNCE_CHAT_ID)
