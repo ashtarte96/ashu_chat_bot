@@ -61,10 +61,8 @@ from database import Database
 from chart_utils import (
     create_clean_candlestick_chart,
     create_perps_chart,
-    create_kr_stock_chart,
     create_us_stock_chart,
     create_kiwoom_kr_stock_chart,
-    find_kr_stock,
     normalize_symbol,
     format_price,
     parse_timeframe,
@@ -1860,7 +1858,7 @@ async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "형식: /ac 티커 [인터벌]\n"
             "예시: /ac BTC  /  /ac ETH 4h  /  /ac BTC 1w\n"
-            "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
+            "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
         )
         return
 
@@ -1873,7 +1871,7 @@ async def cmd_ac(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if tf is None:
             await update.message.reply_text(
                 f"지원하지 않는 인터벌: {args[-1]}\n"
-                "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y"
+                "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y"
             )
             return
         timeframe = tf
@@ -1957,7 +1955,7 @@ async def cmd_ap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "형식: /ap 티커 [인터벌]\n"
             "예시: /ap BTC  /  /ap ETH 4h  /  /ap BTC 1w\n"
-            "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
+            "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
         )
         return
 
@@ -1970,7 +1968,7 @@ async def cmd_ap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if tf is None:
             await update.message.reply_text(
                 f"지원하지 않는 인터벌: {args[-1]}\n"
-                "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y"
+                "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y"
             )
             return
         timeframe = tf
@@ -1993,8 +1991,8 @@ async def cmd_ap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /ak 종목명 [인터벌]  → 한국 주식 차트 (pykrx 기반)
-    예: /ak 삼성전자  /  /ak 005930  /  /ak 한국전력 1w
+    /ak 종목명 [인터벌]  → 한국 주식 차트 (키움증권 REST API: ka10099 종목검색 + ka1008x 차트)
+    예: /ak 삼성전자  /  /ak 005930  /  /ak SK하이닉스 1w
     """
     if not update.message:
         return
@@ -2002,67 +2000,28 @@ async def ak_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
             "형식: /ak 종목명 또는 종목코드 [인터벌]\n"
-            "예시: /ak 삼성전자  /  /ak 005930  /  /ak 한국전력 1w\n"
-            "지원 인터벌: 1d / 1w / 1y  (기본: 1d)\n"
-            "※ 1h / 4h / 12h 입력 시 일봉으로 대체 표시"
+            "예시: /ak 삼성전자  /  /ak 005930  /  /ak SK하이닉스 1w\n"
+            "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
         )
         return
 
+    query, tf = _split_au_query(list(context.args))
+    timeframe = tf or '1d'
+    if not query:
+        await update.message.reply_text("형식: /ak 삼성전자 또는 /ak 005930")
+        return
+
+    logger.info("[AK] input=%s timeframe=%s", query, timeframe)
+    processing_msg = await update.message.reply_text(f"차트 생성 중... {query} ({timeframe})")
+
+    result = await asyncio.to_thread(create_kiwoom_kr_stock_chart, query, timeframe, 'AK')
+
     try:
-        args = list(context.args)
+        await processing_msg.delete()
+    except Exception:
+        pass
 
-        # 마지막 인자가 인터벌이면 분리
-        if args[-1].lower() in VALID_INTERVALS:
-            timeframe = parse_timeframe(args[-1]) or '1d'
-            query = ' '.join(args[:-1]).strip()
-        else:
-            timeframe = '1d'
-            query = ' '.join(args).strip()
-
-        if not query:
-            await update.message.reply_text("형식: /ak 삼성전자 또는 /ak 005930")
-            return
-
-        print("[AK COMMAND]", query, timeframe)
-
-        processing_msg = await update.message.reply_text(f"검색 중... {query}")
-
-        ticker, result = find_kr_stock(query)
-
-        try:
-            await processing_msg.delete()
-        except Exception:
-            pass
-
-        # 완전 일치 → 차트 생성
-        if ticker:
-            name = result
-            print(f"[AK] ticker={ticker} name={name} tf={timeframe}")
-            chart_path, base_caption = create_kr_stock_chart(ticker, name, timeframe)
-            caption = _sanitize_caption(base_caption)
-            try:
-                with open(chart_path, 'rb') as f:
-                    await update.message.reply_photo(photo=f, caption=caption)
-            finally:
-                try:
-                    os.remove(chart_path)
-                except Exception:
-                    pass
-            return
-
-        # 부분 일치 → 후보 목록 안내
-        if isinstance(result, list) and result:
-            lines = ["정확한 종목명을 입력해주세요:\n"]
-            for i, (t, n) in enumerate(result, 1):
-                lines.append(f"{i}. {n} ({t})")
-            await update.message.reply_text('\n'.join(lines))
-            return
-
-        await update.message.reply_text(f"종목을 찾을 수 없습니다: {query}")
-
-    except Exception as e:
-        logger.error("[AK ERROR] %s", e)
-        await update.message.reply_text(f"오류 발생: {e}")
+    await _send_chart_result(update, result)
 
 
 # ═══════════════════════════════════════════════════
@@ -2081,9 +2040,9 @@ def _split_au_query(args: list) -> tuple:
 async def cmd_au(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /au 종목            → 주식 일봉(1d) 차트
-    /au 종목 인터벌     → 지정 인터벌 차트 (1h/4h/12h/1d/1w/1y)
+    /au 종목 인터벌     → 지정 인터벌 차트 (15m/1h/4h/12h/1d/1w/1y)
     한글 종목명·6자리 종목코드 → 국내주식 (키움증권 REST API)
-    영문 티커                  → 해외주식 (기존 로직)
+    영문 티커                  → 해외주식 (키움증권 REST API)
     예: /au 삼성전자  /  /au 005930 1w  /  /au AAPL  /  /au TSLA 1h
     """
     if not update.message:
@@ -2094,7 +2053,7 @@ async def cmd_au(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "형식: /au 종목 [인터벌]\n"
             "예시: /au AAPL  /  /au TSLA 4h  /  /au NVDA 1w\n"
             "국내: /au 삼성전자  /  /au 005930  /  /au SK하이닉스 1w\n"
-            "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
+            "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y  (기본: 1d)"
         )
         return
 
@@ -2120,7 +2079,7 @@ async def cmd_au(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if tf is None:
             await update.message.reply_text(
                 f"지원하지 않는 인터벌: {context.args[1]}\n"
-                "지원 인터벌: 1h / 4h / 12h / 1d / 1w / 1y"
+                "지원 인터벌: 15m / 1h / 4h / 12h / 1d / 1w / 1y"
             )
             return
         timeframe = tf
@@ -2166,7 +2125,7 @@ _HELP_TEXT = (
     "/au AAPL → 미국 주식 / /au 삼성전자 → 국내 주식\n"
     "\n"
     "⏱ 인터벌:\n"
-    "1h / 4h / 12h / 1d / 1w / 1y\n"
+    "15m / 1h / 4h / 12h / 1d / 1w / 1y\n"
     "\n"
     "📰 뉴스 / 일정\n"
     "/news → 글로벌 뉴스 테스트 (관리자)\n"

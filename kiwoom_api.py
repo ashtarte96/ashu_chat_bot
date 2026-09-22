@@ -5,8 +5,10 @@
   - 토큰       POST /oauth2/token  {"grant_type":"client_credentials","appkey":..,"secretkey":..}
                → {"token","token_type","expires_dt"(KST, YYYYMMDDHHMMSS),"return_code","return_msg"}
   - 호출 헤더  api-id / authorization: Bearer <token> / (연속조회) cont-yn, next-key
-  - 종목 목록  ka10099 /api/dostk/stkinfo  body {"mrkt_tp": 시장구분}
-  - 차트       /api/dostk/chart  ka10081 일봉 · ka10082 주봉 · ka10083 월봉 · ka10080 분봉
+  - 종목 목록  ka10099 /api/dostk/stkinfo  body {"mrkt_tp": 시장구분}  (0:코스피, 10:코스닥)
+  - 국내 차트  /api/dostk/chart  ka10081 일봉 · ka10082 주봉 · ka10083 월봉 · ka10080 분봉(tic_scope)
+  - 해외(미국) 현재가/52주  usa20100 /api/us/mrkcond  body {"stex_tp","stk_cd"} (거래소: ND 나스닥/NY 뉴욕거래소/NA 아멕스)
+  - 해외 차트  /api/us/chart  usa06012 일봉 · usa06013 주봉 · usa06014 월봉 · usa06011 분봉(tic_scope)
   - 만료/무효 토큰은 HTTP 401 또는 본문 return_code 8005 → 재발급 후 1회만 재시도
 
 App Key / Secret Key 는 소스에 두지 않고 다음 순서로 읽는다.
@@ -424,16 +426,16 @@ def _public(item: dict) -> dict:
     return {k: item[k] for k in ('code', 'name', 'market', 'market_name')}
 
 
-# ── 차트 (OHLCV) ─────────────────────────────────────────────────────
+# ── 차트 (OHLCV, 국내) ─────────────────────────────────────────────────
 
-# 봉 종류 → (api-id, 응답 리스트 키)
+# 봉 종류 → (api-id, 응답 리스트 키). 'minute' 은 tic_scope 필요 (1/3/5/10/15/30/45/60분)
 _CHART_API = {
-    'day':   ('ka10081', 'stk_dt_pole_chart_qry'),
-    'week':  ('ka10082', 'stk_stk_pole_chart_qry'),
-    'month': ('ka10083', 'stk_mth_pole_chart_qry'),
-    'hour':  ('ka10080', 'stk_min_pole_chart_qry'),     # tic_scope=60
+    'day':    ('ka10081', 'stk_dt_pole_chart_qry'),
+    'week':   ('ka10082', 'stk_stk_pole_chart_qry'),
+    'month':  ('ka10083', 'stk_mth_pole_chart_qry'),
+    'minute': ('ka10080', 'stk_min_pole_chart_qry'),
 }
-_REGULAR_HOURS = range(9, 16)    # 60분봉 라벨 09:00~15:00 = 정규장 (16시 이후는 시간외/NXT)
+_REGULAR_HOURS = range(9, 16)    # 국내 분봉 정규장 09:00~15:xx (16시 이후는 시간외/NXT)
 
 
 def _num(value) -> float:
@@ -442,20 +444,25 @@ def _num(value) -> float:
     return abs(float(text)) if text else 0.0
 
 
-def fetch_ohlcv(code: str, kind: str = 'day', min_rows: int = 60) -> pd.DataFrame:
+def fetch_ohlcv(code: str, kind: str = 'day', tic_scope: Optional[str] = None,
+                min_rows: int = 60) -> pd.DataFrame:
     """국내주식 OHLCV (오름차순, KST tz-aware index, 컬럼 open/high/low/close/volume).
 
-    kind: 'day' | 'week' | 'month' | 'hour'(60분봉, 정규장만). 연속조회로 min_rows 이상 모은다.
+    kind: 'day' | 'week' | 'month' | 'minute'(tic_scope 필수: '15','60' 등, 정규장만).
+    연속조회로 min_rows 이상 모은다.
     """
     if kind not in _CHART_API:
         raise KiwoomDataError(f'지원하지 않는 봉 종류: {kind}')
     api_id, key = _CHART_API[kind]
     body = {'stk_cd': code, 'upd_stkpc_tp': '1'}
-    if kind == 'hour':
-        body['tic_scope'] = '60'
+    if kind == 'minute':
+        if not tic_scope:
+            raise KiwoomDataError('분봉 조회에는 tic_scope 가 필요합니다')
+        body['tic_scope'] = tic_scope
     else:
         body['base_dt'] = datetime.now(KST).strftime('%Y%m%d')
-    logger.info('[KIWOOM CHART] symbol=%s kind=%s api=%s', code, kind, api_id)
+    logger.info('[KIWOOM CHART] symbol=%s kind=%s tic_scope=%s api=%s',
+                code, kind, tic_scope or '-', api_id)
 
     records: dict = {}
     cont_yn = next_key = ''
@@ -464,7 +471,7 @@ def fetch_ohlcv(code: str, kind: str = 'day', min_rows: int = 60) -> pd.DataFram
         for row in data.get(key) or []:
             try:
                 close = _num(row.get('cur_prc'))
-                if kind == 'hour':
+                if kind == 'minute':
                     tm = str(row.get('cntr_tm', ''))
                     if len(tm) < 12 or int(tm[8:10]) not in _REGULAR_HOURS:
                         continue
@@ -487,4 +494,109 @@ def fetch_ohlcv(code: str, kind: str = 'day', min_rows: int = 60) -> pd.DataFram
                                 columns=['open', 'high', 'low', 'close', 'volume']).sort_index()
     df.index.name = 'timestamp'
     logger.info('[KIWOOM CHART] received rows=%d', len(df))
+    return df
+
+
+# ── 해외(미국) 주식: 현재가/52주 · 차트(OHLCV) ──────────────────────────
+
+_US_EXCHANGES        = ('ND', 'NY', 'NA')   # 나스닥 / 뉴욕거래소 / 아멕스
+_US_EXCHANGE_CACHE: dict = {}
+US_TZ                = pytz.timezone('America/New_York')
+
+# 봉 종류 → (api-id, 응답 리스트 키). 'minute' 은 tic_scope 필요
+_US_CHART_API = {
+    'day':    ('usa06012', 'result_list'),
+    'week':   ('usa06013', 'result_list'),
+    'month':  ('usa06014', 'result_list'),
+    'minute': ('usa06011', 'result_list'),
+}
+_US_REGULAR_HOURS = range(9, 17)   # 09:00~16:00 ET 정규장 (그 외는 프리·애프터마켓)
+
+
+def us_quote(symbol: str) -> tuple:
+    """(거래소구분, 현재가 종목정보 응답). 종목이 ND/NY/NA 어디에도 없으면 KiwoomDataError.
+    거래소는 종목별로 캐시해 재조회 시 첫 시도에 맞춘다."""
+    symbol = symbol.upper().strip()
+    cached = _US_EXCHANGE_CACHE.get(symbol)
+    last_err: Optional[Exception] = None
+    for ex in ((cached,) if cached else _US_EXCHANGES):
+        try:
+            data, _, _ = _request('usa20100', '/api/us/mrkcond', {'stex_tp': ex, 'stk_cd': symbol})
+        except KiwoomAuthError:
+            raise
+        except KiwoomError as e:
+            last_err = e
+            continue
+        if not str(data.get('stk_cd') or '').strip():
+            last_err = KiwoomDataError('empty quote')
+            continue
+        _US_EXCHANGE_CACHE[symbol] = ex
+        return ex, data
+    raise KiwoomDataError(f'미국 종목 조회 실패: {symbol} ({last_err})')
+
+
+def us_52w_range(quote: dict) -> tuple:
+    """(52주 최고가, 52주 최저가). 키움은 최저가에 전일대비 방향 부호를 붙여 줄 수 있어 절대값 사용."""
+    def _v(key: str) -> Optional[float]:
+        try:
+            v = abs(float(str(quote.get(key, '')).replace(',', '')))
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return _v('52wk_hgst_pric'), _v('52wk_lwst_pric')
+
+
+def fetch_us_ohlcv(symbol: str, exchange: str, kind: str = 'day',
+                   tic_scope: Optional[str] = None, min_rows: int = 60) -> pd.DataFrame:
+    """해외(미국)주식 OHLCV (오름차순, America/New_York tz-aware index).
+
+    kind: 'day' | 'week' | 'month' | 'minute'(tic_scope 필수, 정규장만).
+    """
+    if kind not in _US_CHART_API:
+        raise KiwoomDataError(f'지원하지 않는 봉 종류: {kind}')
+    api_id, key = _US_CHART_API[kind]
+    body = {
+        'stex_tp': exchange, 'stk_cd': symbol,
+        'strt_dt': datetime.now(US_TZ).strftime('%Y%m%d'),
+        'upd_stkpc_tp': '1', 'exrt_appl_tp': '0',
+    }
+    if kind == 'minute':
+        if not tic_scope:
+            raise KiwoomDataError('분봉 조회에는 tic_scope 가 필요합니다')
+        body['tic_scope'] = tic_scope
+    logger.info('[KIWOOM US CHART] symbol=%s exchange=%s kind=%s tic_scope=%s api=%s',
+                symbol, exchange, kind, tic_scope or '-', api_id)
+
+    records: dict = {}
+    cont_yn = next_key = ''
+    for page in range(_MAX_PAGES):
+        data, cont_yn, next_key = _request(api_id, '/api/us/chart', body, cont_yn, next_key)
+        for row in data.get(key) or []:
+            try:
+                close = _num(row.get('cur_prc'))
+                o, h, l = _num(row.get('open_pric')), _num(row.get('high_pric')), _num(row.get('low_pric'))
+                if close <= 0 or o <= 0 or h <= 0 or l <= 0:
+                    continue
+                if kind == 'minute':
+                    tm = str(row.get('cntr_tm', ''))
+                    if len(tm) < 14 or int(tm[8:10]) not in _US_REGULAR_HOURS:
+                        continue
+                    ts  = pd.Timestamp(datetime.strptime(tm[:14], '%Y%m%d%H%M%S')).tz_localize(US_TZ)
+                    vol = row.get('trde_qty')
+                else:
+                    ts  = pd.Timestamp(datetime.strptime(str(row.get('dt', '')), '%Y%m%d')).tz_localize(US_TZ)
+                    vol = row.get('acc_trde_qty')
+                records[ts] = (o, h, l, close, _num(vol))
+            except (ValueError, TypeError):
+                continue
+        if cont_yn != 'Y' or len(records) >= min_rows:
+            break
+        time.sleep(_PAGE_DELAY)
+
+    if not records:
+        raise KiwoomDataError(f'차트 데이터 없음: {symbol}')
+    df = pd.DataFrame.from_dict(records, orient='index',
+                                columns=['open', 'high', 'low', 'close', 'volume']).sort_index()
+    df.index.name = 'timestamp'
+    logger.info('[KIWOOM US CHART] received rows=%d', len(df))
     return df
